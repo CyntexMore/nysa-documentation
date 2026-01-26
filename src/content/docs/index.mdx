@@ -1,40 +1,39 @@
 ---
-title: Welcome to Starlight
-description: Get started building your docs site with Starlight.
-template: splash # Remove or comment out this line to display the site sidebar on this page.
+title: Welcome to Nysa!
+description: Your general-purpose AI runtime.
+template: splash
 hero:
-  tagline: Congrats on setting up a new Starlight project!
+  tagline: Your general-purpose AI daemon, built 100% in TypeScript.
   image:
     file: ../../assets/houston.webp
   actions:
-    - text: Example Guide
-      link: /guides/example/
+    - text: Introduction
+      link: /introduction/what-is-this
       icon: right-arrow
-    - text: Read the Starlight docs
-      link: https://starlight.astro.build
+    - text: View the Source Code
+      link: https://github.com/CyntexMore/nysa
       icon: external
       variant: minimal
 ---
 
 import { Card, CardGrid } from '@astrojs/starlight/components';
 
-## Next steps
+## Features
 
 <CardGrid stagger>
-	<Card title="Update content" icon="pencil">
-		Edit `src/content/docs/index.mdx` to see this page change.
+	<Card title="Chat with Nysa" icon="discord">
+	    Chat with Nysa on Discord, Telegram, and Slack. Not just text, but voice calls are also supported on Discord. Extendible via the SDK!
 	</Card>
-	<Card title="Change page layout" icon="document">
-		Delete `template: splash` in `src/content/docs/index.mdx` to display a
-		sidebar on this page.
+	<Card title="Play Games with Nysa" icon="rocket">
+	    You can play Minecraft with Nysa out of the box, or you can implement any other game via the SDK.
 	</Card>
-	<Card title="Add new content" icon="add-document">
-		Add Markdown or MDX files to `src/content/docs` to create new pages.
+	<Card title="BYO API" icon="pencil">
+	    Self-host your own instance of Nysa and bring your own API and keys. If any API you'd like to use is not implemented, you can easily do it yourself with the SDK.
 	</Card>
-	<Card title="Configure your site" icon="setting">
-		Edit your `sidebar` and other config in `astro.config.mjs`.
+	<Card title="Customize Nysa" icon="setting">
+	    You can easily customize Nysa's persona and LLM settings through a `.env` file or the web interface.
 	</Card>
-	<Card title="Read the docs" icon="open-book">
-		Learn more in [the Starlight Docs](https://starlight.astro.build/).
+	<Card title="Search Plugins" icon="open-book">
+	    Easily search for Nysa plugins and platform/game integrations in the marketplace.
 	</Card>
 </CardGrid>

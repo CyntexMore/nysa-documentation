@@ -1,0 +1,135 @@
+---
+title: Memory Engine (nmgine) Specifications
+description: Specifications for Nysa's memory engine (nmgine).
+---
+
+import { Steps, Card } from '@astrojs/starlight/components';
+
+The memory engine (nmgine) is responsible for maintaining conversational context accross sessions. It stores important facts, user preferences, and conversation history. This component is critical, because it enables Nysa to have a coherent, personalized conversations that improve over time.
+
+Coming from the inherently modular architecture of Nysa, nmgine is usable as the memory engine of any other application as well. It should be exposed as the `@nysa-daemon/nmgine` npm package.
+
+## Problem Statement
+
+Without nmgine, Nysa would just have a pre-set personality that doesn't evolve over time and it wouldn't remember anything between sessions, making it a generic AI chatbot. The main challanges are:
+
+* **Not nuking context**: LLMs have a limited context window (e.g., 200k tokens for [Claude Opus 4.5](https://openrouter.ai/anthropic/claude-opus-4.5)). If we naively compress everything, important details are lost. If we don't compress anything, important details are lost as well because models generally start going down-hill in intelligence after >50k tokens and the conversation breaks.
+* **Weighing importance**: Not all memories are equal. "User's name is Jane Doe" should persists forever. "User ordered pizza yesterday" can fade quickly.
+* **Fading memories over time**: Humans forget details, but remember gist. A memory from a week ago should be significantly shorter and fuzzier than yesterday's memory.
+
+We need a solution that balances all three: staying within token limits, preserving what matters, and mimicking natural memory decay.
+
+## Architecture
+
+## Saving Memories
+
+nmgine has six main steps to take when saving memories:
+
+<Steps>
+1. Listen to all input.
+2. Store the current session's chat history.
+3. The bot runs context compression every `M` minutes. When that happens, let it run two prompts: 1) one that summarizes the session's history, 2) and one that evaluates what is worth saving from the summary.
+4. Let the model save memories to a database via exposed tools (with a proper validation layers; never let the model run SQL commands directly) that it can call, that let's it choose importance.
+5. Efficiently index the memories.
+6. Degrade memory integrity over time and eventually auto-delete entries. Memories with higher importance have a higher immunity to integrity degradation.
+</Steps>
+
+<br/>
+<Card title="Integrity Degradation" icon="information">
+    Integrity degradation in this context means a model evaluating through the indexed memories and making them shorter (the `content` more vague based on forced summarization) and shorter based on creation date and importance. Higher importance = higher immunity to integrity degradation, which means more time has to pass before they get as radically degraded as memories with a lower importance.
+
+    Memory degradation happens every `D` days, where `D` is user-defined. Degradation is done in a hybrid approach: 1) degrade when memory is older than `M` minutes, 2) when `refreshCount` passes a `T` threshold, bring in a model to degrade and evaluate manually.
+    
+    Level 0 is full text (fresh). Level 1 is lightly normalized (cleaned phrasing). Level 2 is summary. Level 3 is summary of a summary. Level 4 keywords. Level 5 empty (empty memories are auto-wiped every `M` minutes).
+    
+    Memories with a higher `refreshCount` can get upgraded to a lower level (e.g., Level 2 -> Level 1), so useful ones don't get punished.
+</Card>
+<br/>
+
+## Memory Retrieval
+
+And it has four more steps to take when serving back memories:
+
+<Steps>
+1. Take a tool call with keywords.
+2. List the model the first `N` memories based on top-K results from a vectorized database.
+3. Run a smaller model that ranks the top-K results by relevance.
+4. Retrieve the entire memory/memories.
+</Steps>
+
+A bias for retrieval is `(relevance * 0.8) + (recency * 0.2)`.
+
+## Rules
+
+### Memory Retrieval
+
+This rule should be applied on memory retrieval with a system prompt:
+
+1. If a memory has a `userId` array tied to it, it means it belongs entirely to those whose user IDs are present. Never treat it like another person's personal preferences or data.
+
+### Compression Rules
+
+These are the general rule(s) that should be enforced on the second prompt of the two-pass compression with a system prompt:
+
+1. Don't save every tiny detail. Think about how a human brain stores information.
+2. When the model is saving information, it has to check for conflicting data points (per user, for `personal`) and update/overwrite the older one. This happens by running the model running a memory retrieval process.
+3. It must evaluate memories older than 24 hours and overwrite the `content` and also update the `integrityLevel`.
+
+If `importance >= 8` must be semantic OR long-lived episodic. If `importance <= 3`, auto-expire cap (cannot surive past `D` days).
+
+## Design Decisions
+
+### Two-Pass Compression (Summary -> Evaluation)
+
+Use two separate model calls instead of one.
+
+Why two passes?
+
+* First pass (summary): captures everything neutrally without bias. Gives a structured output with timestamps and topics.
+* Second pass (evaluation): decides what's worth keeping with fresh context.
+
+The alternative approach (single pass) would be faster but model might miss nuances while trying to do both tasks.
+
+The tradeoff is 2x the API calls, but significantly better memory quality in testing.
+
+# Technical
+
+## Data Model
+
+### Memory Object
+
+```typescript
+interface Memory {
+  id: number; // Index of the memory
+  userId?: string[]; // Social platform user ID(s)
+  shortName: string; // "User's favorite food"
+  type: MemoryType; // Episodic or Semantic
+  content: string; // "Jane prefers vegetarian meals, especially Thai curry."
+  importance: number; // 0-10 score, assigned by model
+  confidence: number; // 0-10 score, assigned by the model; defines how confident the user is in their claim
+  createdAt: Date;
+  lastAcessedAt: Date;
+  integrityLevel: number; // 0 (fresh) - 5 (heavily degraded)
+  originalLength: number; // Track compression ratio
+  refreshCount: number; // The amount of times the memory has been retrieved
+}
+```
+
+### Memory Type
+```typescript
+enum MemoryType {
+  Episodic,
+  Semantic
+}
+```
+
+# Models
+
+|Model|Role|Recommendation|
+|:----|:--:|-------------:|
+|`MEMORY_EVALUATION_MODEL`|Evaluates what memories to save.|Smart, decently priced model.|
+|`MEMORY_COMPRESSION_MODEL`|Summarizes/compresses memories.|Cheap, fast model.|
+|`MEMORY_INTEGRITY_DEGRADATION_MODEL`|Decides how to degrade a memory.|Recommended to be the same model as `MEMORY_EVALUATION_MODEL`|
+|`MEMORY_RETRIEVAL_RANKING_MODEL`|Ranks the returned top-K results for memory retrieval.|A small reranker.|
+
+These can be set via environment variables.

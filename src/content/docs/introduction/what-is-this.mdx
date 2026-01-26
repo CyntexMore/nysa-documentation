@@ -1,0 +1,35 @@
+---
+title: What is this?
+description: What is Nysa?
+---
+
+Nysa (pronounced /neesa/) is a general-purpose AI daemon. It is open-source and written 100% in TypeScript; though it requires native binaries for some features. You can run it on your own machine, a two euro VPS, or a Raspberry Pi. If it can run Node/Bun, it can run Nysa.
+
+Since it's already expensive to run for testing (this has to be fixed...), it is designed to be used with any API of your choice. You're not vendor locked.
+
+## Features
+
+Here are some of the features:
+
+* texting on Discord and Telegram, both in private messages and groups/guilds;
+* voice calling on Discord (it also has a soundboard ;3);
+* playing games with you (Minecraft is supported out of the box);
+* accessing your filesystem, **with consent**;
+* running commands on your machine, full access, or isolated;
+* a fully custom memory engine that works just like how a human remembers things: repetition reinforces memories, importance is figured out by context, and with time, memories fade.
+
+The possibilites are endless, thanks to the Social- and Game SDKs. You can search the [Marketplace](/marketplace) for personas, plugins, and platform integrations, or you can [make your own](/guides/overview). Everything is just an additional tool the model can call.
+
+## Models
+
+You can use separate models for the main chat model, voice call "chat model" (that processes and produces the text), the text-to-speech model, the speech-to-text model, and the memory engine model.
+
+While you can bring any API and model you want for any task, it is recommended that, for example, for the main chat model, you use a model that balances speed, intelligence, conversations skills, tool calling capabilities, and cost nicely; one example is [Kimi K2 0905](https://openrouter.ai/moonshotai/kimi-k2-0905). It is discouraged to use heavier, slower reasoning models such as [Gemini 3 Flash](https://openrouter.ai/google/gemini-3-flash-preview), because the response speeds and quality will be much worse (for this use case) and the costs will be way higher. It is not recommended to use Gemini models for agentic tasks anyways, because they're horrendous at tool calling, but that's besides the point. [OpenRouter](https://openrouter.ai/) is generally recommended for this role, as the costs are quite good. But for real-time voice calls, [Groq](https://groq.com/) would be more beneficial for its higher speeds (~200-300 tokens per second), despite the [~160% cost per million tokens on Kimi](https://console.groq.com/docs/model/moonshotai/kimi-k2-instruct-0905) compared to OR.
+
+For voice calls, the recommended TTS model is [Whisper Large V3 Turbo](https://console.groq.com/docs/model/whisper-large-v3-turbo) through the Groq API. It is very good at its job, very fast, and very cheap. Running [Whisper Small V3 EN Q5_1](https://huggingface.co/ggerganov/whisper.cpp/blob/main/ggml-small.en-q5_1.bin) locally through [whisper.cpp](https://github.com/ggml-org/whisper.cpp) with [tinydiarize](https://github.com/akashmjn/tinydiarize) might actually be beneficial for multi-person conversations; there is planned better support for tinydiarize input in the future. On the note of tinydiarize, Nysa already separates different user inputs based on the speaker's user ID. As for the STT model, you could either use [Orpheus V1 English](https://console.groq.com/docs/model/canopylabs/orpheus-v1-english), or [Fish Audio S1](https://docs.fish.audio/developer-guide/getting-started/introduction), if you want a custom voice, instead of the default one; though Fish Audio S1 is quite a bit more expensive that Orpheus.
+
+## Expenses
+
+If you haven't realized yet while reading the introduction, Nysa costs a lot of money to run currently. There are cost optimizations being planned, but given the complexity of Nysa's architecture, it's hard to do.
+
+If Nysa is making you go bankrupt, you can turn to the nuclear option and disable nmgine. This will **heavily** impact the user experience though. Keep that in mind. A less radical approach is setting up a smaller local model with [llama.cpp](https://github.com/ggml-org/llama.cpp), using [quantized KV cache](https://github.com/ggml-org/llama.cpp/issues/6863), with a context limit the size of a session's context limit.
