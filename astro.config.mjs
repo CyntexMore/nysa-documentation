@@ -32,6 +32,10 @@ export default defineConfig({
               label: "Memory Engine (nmgine)",
               slug: "specifications/memory-engine",
             },
+            {
+              label: "AI SDK",
+              slug: "specifications/ai-sdk",
+            },
           ],
         },
       ],

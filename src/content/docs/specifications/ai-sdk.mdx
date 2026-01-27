@@ -1,0 +1,316 @@
+---
+title: AI SDK
+description: Specifications for Nysa's AI SDK.
+---
+
+import { Steps, Card } from '@astrojs/starlight/components';
+
+The AI SDK is responsible for providing a unified interface to integrate **any AI SDK or provider** to be used with Nysa. This includes both direct provider APIs (OpenAI API, Anthropic API) and third-party AI SDKs (OpenRouter SDK, Groq SDK, Vercel AI SDK, LangChain, etc.). It exposes critical functions and interfaces to define how a message is sent, tool calls are handled, streaming works, etc., so that implementing a new SDK or API doesn't require changing anything else in the codebase.
+
+Should be exposed via `@nysa-daemon/ai-sdk`.
+
+## Problem Statement
+
+Without the AI SDK, Nysa's core components would require constant updates to keep up with all the new AI APIs and SDKs, and it would be a ton of hassle to maintain and extend. The main challenges are:
+
+* **SDK/Provider fragmentation**: Different AI providers have different API structures, and different SDKs (OpenRouter, Groq, Vercel AI SDK, LangChain) have their own abstractions and patterns.
+* **Feature inconsistency**: Not all providers/SDKs support the same features (streaming, tool calling, vision, etc.), requiring graceful degradation.
+* **Breaking changes**: AI providers and SDKs frequently update their APIs, which would cascade changes throughout the codebase.
+* **Tool system differences**: Each provider has different tool calling formats (OpenAI's function calling, Anthropic's tool use, Google's function declarations).
+
+We need a unified abstraction layer that handles all provider-specific and SDK-specific logic while exposing a consistent interface to the rest of Nysa. **Nysa should never know or care which AI provider or SDK is being used.**
+
+## Architecture
+
+The AI SDK follows a provider pattern with adapters for each AI service or SDK:
+
+1. **Core Interface**: Defines standard message, completion, and tool calling interfaces
+2. **Adapter Layer**: 
+   - **SDK Adapters**: Wrap existing AI SDKs (OpenRouter, Groq, Vercel AI, LangChain)
+   - **API Adapters**: Direct integrations with provider APIs (OpenAI, Anthropic, Google)
+3. **Provider Registry**: Manages available providers/SDKs and their capabilities
+4. **Tool System**: Unified tool definition that works across all SDKs
+
+Both adapter types implement the same `AIProvider` interface, ensuring consistent behavior regardless of underlying implementation.
+
+## Message Flow
+
+<Steps>
+1. Application creates a request using the unified interface
+2. AI SDK validates the request and selects appropriate adapter
+3. Adapter transforms request to provider/SDK-specific format
+4. Request is sent with retry logic and error handling
+5. Response is transformed back to unified format
+6. Tool calls (if any) are extracted and executed
+7. Results are returned to the application
+</Steps>
+
+## Design Decisions
+
+### Why Adapters for Both SDKs and APIs?
+
+Using adapters for both SDKs (like OpenRouter, Groq) and direct APIs (like Anthropic) allows:
+* Clean separation between provider-specific logic and application code
+* Easy addition of new providers/SDKs without modifying core code
+* Leverage existing SDK features (retries, rate limiting) where beneficial
+* Direct API control when needed for advanced features
+
+The alternative (direct API calls only, or single SDK only) would either miss out on existing SDK benefits or tightly couple Nysa to specific SDKs.
+
+### Why Unified Tool Format?
+
+Different providers have different tool calling formats. A unified format allows:
+* Write tools once, use everywhere
+* Automatic conversion to provider-specific formats
+* Consistent tool execution regardless of provider
+* Easier testing and mocking
+
+The tradeoff is a small transformation overhead, but this is negligible compared to network latency.
+
+## Technical
+
+## Data Model
+
+### CompletionRequest
+
+```typescript
+interface CompletionRequest {
+  messages: Message[];
+  model: string;
+  provider?: string; // Auto-detect if not specified
+  temperature?: number;
+  maxTokens?: number;
+  topP?: number;
+  stop?: string[];
+  tools?: Tool[];
+  toolChoice?: "auto" | "required" | "none" | { name: string };
+  stream?: boolean;
+  metadata?: Record<string, unknown>; // Provider-specific settings
+}
+```
+
+### CompletionResponse
+
+```typescript
+interface CompletionResponse {
+  id: string;
+  message: Message;
+  usage: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+    estimatedCost?: number;
+  };
+  model: string;
+  provider: string;
+  finishReason: "stop" | "length" | "tool_calls" | "content_filter" | "error";
+  metadata?: Record<string, unknown>;
+}
+```
+
+### Message
+
+```typescript
+interface Message {
+  role: "user" | "assistant" | "system" | "tool";
+  content: string | ContentPart[];
+  name?: string; // For tool messages
+  toolCallId?: string; // For tool responses
+  toolCalls?: ToolCall[]; // For assistant messages with tool calls
+}
+
+type ContentPart = 
+  | { type: "text"; text: string }
+  | { type: "image_url"; imageUrl: { url: string } }
+  | { type: "image"; source: { type: "base64"; mediaType: string; data: string } };
+```
+
+### Tool
+
+```typescript
+interface Tool {
+  name: string;
+  description: string;
+  parameters: JSONSchema;
+  handler: ToolHandler;
+  metadata?: {
+    cacheHint?: boolean; // For prompt caching
+    requiresConfirmation?: boolean;
+  };
+}
+
+type ToolHandler = (
+  params: Record<string, unknown>,
+  context: ToolContext
+) => Promise<ToolResult>;
+
+interface ToolContext {
+  conversationId?: string;
+  userId?: string;
+  metadata?: Record<string, unknown>;
+}
+```
+
+### AIProvider Interface
+
+```typescript
+interface AIProvider {
+  readonly name: string;
+  readonly capabilities: ProviderCapabilities;
+  
+  complete(request: CompletionRequest): Promise<CompletionResponse>;
+  stream(request: CompletionRequest): AsyncIterable<StreamChunk>;
+  
+  transformRequest(request: CompletionRequest): ProviderSpecificRequest;
+  transformResponse(response: ProviderSpecificResponse): CompletionResponse;
+  transformTools(tools: Tool[]): ProviderSpecificTools;
+  
+  handleError(error: unknown): AIError;
+  shouldRetry(error: AIError): boolean;
+}
+
+interface ProviderCapabilities {
+  streaming: boolean;
+  toolCalling: boolean;
+  vision: boolean;
+  jsonMode: boolean;
+  maxTokens: number;
+  maxContextLength: number;
+}
+```
+
+## Core Functions
+
+### `createCompletion(...)`
+
+#### Parameters
+
+* `request: CompletionRequest`: The completion request
+
+#### Returns
+
+* `Promise<CompletionResponse>`: The completion response
+
+#### Description
+
+Sends a completion request to the appropriate provider/SDK and returns a unified response.
+
+### `streamCompletion(...)`
+
+#### Parameters
+
+* `request: CompletionRequest`: The completion request with `stream: true`
+
+#### Returns
+
+* `AsyncIterable<StreamChunk>`: Stream of response chunks
+
+#### Description
+
+Streams a completion response, yielding chunks as they arrive.
+
+### `registerAdapter(...)`
+
+#### Parameters
+
+* `adapter: AIProvider`: The provider adapter to register
+
+#### Description
+
+Registers a new provider/SDK adapter with the AI SDK.
+
+### `registerTool(...)`
+
+#### Parameters
+
+* `tool: Tool`: The tool definition to register
+
+#### Description
+
+Registers a tool that can be used across all completions.
+
+### `executeTool(...)`
+
+#### Parameters
+
+* `toolCall: ToolCall`: The tool call to execute
+* `context: ToolContext`: Execution context
+
+#### Returns
+
+* `Promise<ToolResult>`: The tool execution result
+
+#### Description
+
+Executes a registered tool with the provided parameters and context.
+
+## Built-in Adapters
+
+The AI SDK should ship with adapters for common providers and SDKs:
+
+**SDK Adapters:**
+* OpenRouter (`openrouter`) - Multi-provider routing
+* Groq (`groq`) - Ultra-fast inference
+* Vercel AI (`vercel-ai`) - Universal AI SDK wrapper
+
+Each adapter handles authentication, request/response transformation, error mapping, and provider-specific features.
+
+## Error Handling
+
+### Error Types
+
+```typescript
+enum AIErrorType {
+  AuthenticationError = "authentication_error",
+  RateLimitError = "rate_limit_error",
+  InvalidRequestError = "invalid_request_error",
+  APIError = "api_error",
+  NetworkError = "network_error",
+  TimeoutError = "timeout_error",
+  ProviderNotFoundError = "provider_not_found_error",
+  ToolExecutionError = "tool_execution_error"
+}
+
+class AIError extends Error {
+  constructor(
+    public type: AIErrorType,
+    message: string,
+    public provider?: string,
+    public retryable: boolean = false
+  ) {
+    super(message);
+  }
+}
+```
+
+### Retry Strategy
+
+The SDK implements exponential backoff with jitter for retryable errors:
+* Initial delay: 1 second
+* Maximum delay: 60 seconds
+* Maximum retries: 3
+
+Only certain error types are retried: rate limits (with respect to retry-after headers), network errors, timeout errors, and server errors (5xx).
+
+## Integration with nmgine
+
+The AI SDK integrates with nmgine through:
+* Automatic memory injection into system prompts
+* Memory tools registered as standard tools
+* Conversation tracking that triggers memory compression
+* Token usage tracking per memory operation
+
+## Configuration
+
+Configuration is handled via environment variables:
+
+**General:**
+* `AI_SDK_DEFAULT_PROVIDER`: Default provider/SDK (e.g., "openrouter", "anthropic")
+* `AI_SDK_DEFAULT_MODEL`: Default model
+* `AI_SDK_REQUEST_TIMEOUT`: Request timeout in ms (default: 60000)
+* `AI_SDK_MAX_RETRIES`: Maximum retry attempts (default: 3)
+
+**Provider-Specific:**
+* `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.
+
+Configuration can be overridden per request via the `provider` and `metadata` fields.
