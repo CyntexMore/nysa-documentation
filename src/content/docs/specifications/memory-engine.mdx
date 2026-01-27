@@ -127,6 +127,36 @@ enum MemoryType {
 }
 ```
 
+## Tools
+
+### `suggests_category(...)`
+
+#### Parameters
+
+* `name: string`: name of the category
+
+#### Description
+
+Suggests the creation of a category, `name`. Runs a prompt with that checks if a fitting category already exists (this should be relatively conservative).
+
+#### Model Used Internally
+
+* `MEMORY_EVALUATION_MODEL`
+
+### `retrieve_memory(...)`
+
+#### Parameters
+
+* `keyword: string`: keywords for the memory to return
+
+#### Description
+
+Returns the first `N` (reranked) top-K results from the memory database.
+
+#### Model Used Internally
+
+* `MEMORY_RETRIEVAL_RANKING_MODEL`
+
 # Models
 
 |Model|Role|Recommendation|
