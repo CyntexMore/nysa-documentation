@@ -1,0 +1,316 @@
+---
+title: AI SDK
+description: NysaのAI SDK仕様書です。
+---
+
+import { Steps, Card } from '@astrojs/starlight/components';
+
+AI SDKは、**あらゆるAI SDKまたはプロバイダ**をNysaで使用するための統一インターフェースを提供することを目的としています。これには、直接的なプロバイダAPI（OpenAI API、Anthropic API）とサードパーティのAI SDK（OpenRouter SDK、Groq SDK、Vercel AI SDK、LangChainなど）の両方が含まれます。メッセージの送信方法、ツールコールの処理方法、ストリーミングの動作などを定義する重要な関数とインターフェースを公開することで、新しいSDKやAPIを実装してもコードベースの他の部分を変更する必要がなくなります。
+
+`@nysa-daemon/ai-sdk`として公開される必要があります。
+
+## 問題提起
+
+AI SDKがない場合、Nysaのコアコンポーネントは常に新しいAI APIやSDKに追従するための更新が必要となり、メンテナンスと拡張に多大な手間がかかります。主な課題は以下の通りです：
+
+* **SDK/プロバイダの断片化**: 異なるAIプロバイダは異なるAPI構造を持っており、異なるSDK（OpenRouter、Groq、Vercel AI SDK、LangChain）は独自の抽象化とパターンを持っています。
+* **機能の不一致**: すべてのプロバイダ/SDKが同じ機能（ストリーミング、ツールコール、ビジョンなど）をサポートしているわけではなく、優雅な機能低下が必要です。
+* **破壊的変更**: AIプロバイダやSDKは頻繁にAPIを更新しており、これがコードベース全体に変更を波及させる可能性があります。
+* **ツールシステムの違い**: 各プロバイダは異なるツールコール形式を持っています（OpenAIの関数コール、Anthropicのツール使用、Googleの関数宣言）。
+
+プロバイダ固有およびSDK固有のロジックをすべて処理しながら、Nysaの他の部分に一貫したインターフェースを公開する統合抽象化レイヤーが必要です。**NysaはどのAIプロバイダやSDKが使用されているかを知る必要も、気にする必要もありません。**
+
+## アーキテクチャ
+
+AI SDKは、各AIサービスまたはSDK用のアダプターを持つプロバイダパターンに従います：
+
+1. **コアインターフェース**: 標準的なメッセージ、コンプリーション、ツールコールインターフェースを定義します
+2. **アダプターレイヤー**: 
+   - **SDKアダプター**: 既存のAI SDKをラップします（OpenRouter、Groq、Vercel AI、LangChain）
+   - **APIアダプター**: プロバイダAPIとの直接的な統合（OpenAI、Anthropic、Google）
+3. **プロバイダレジストリ**: 利用可能なプロバイダ/SDKとその機能を管理します
+4. **ツールシステム**: すべてのSDKで動作する統一されたツール定義
+
+両方のアダプタータイプは同じ`AIProvider`インターフェースを実装し、基盤となる実装に関係なく一貫した動作を保証します。
+
+## メッセージフロー
+
+<Steps>
+1. アプリケーションが統合インターフェースを使用してリクエストを作成します
+2. AI SDKがリクエストを検証し、適切なアダプターを選択します
+3. アダプターがリクエストをプロバイダ/SDK固有の形式に変換します
+4. リトライロジックとエラーハンドリングを伴ってリクエストが送信されます
+5. レスポンスが統一形式に変換されます
+6. ツールコール（存在する場合）が抽出されて実行されます
+7. 結果がアプリケーションに返されます
+</Steps>
+
+## 設計上の決定事項
+
+### なぜSDKとAPIの両方にアダプターを使用するのか？
+
+SDK（OpenRouter、Groqなど）と直接API（Anthropicなど）の両方にアダプターを使用することで、以下が可能になります：
+* プロバイダ固有のロジックとアプリケーションコードの明確な分離
+* コアコードを変更せずに新しいプロバイダ/SDKを簡単に追加
+* 既存のSDK機能（リトライ、レート制限）を活用
+* 高度な機能が必要な場合に直接API制御
+
+代替案（直接APIコールのみ、または単一SDKのみ）では、既存のSDKの利点を見逃すか、Nysaを特定のSDKに密結合させることになります。
+
+### なぜ統一ツール形式を使用するのか？
+
+異なるプロバイダは異なるツールコール形式を持っています。統一形式を使用することで、以下が可能になります：
+* ツールを一度書けばどこでも使用可能
+* プロバイダ固有の形式への自動変換
+* プロバイダに関係ない一貫したツール実行
+* より簡単なテストとモック
+
+トレードオフは小さな変換オーバーヘッドですが、これはネットワークレイテンシと比較して無視できる程度です。
+
+## 技術仕様
+
+## データモデル
+
+### CompletionRequest
+
+```typescript
+interface CompletionRequest {
+  messages: Message[];
+  model: string;
+  provider?: string; // 指定されていない場合は自動検出
+  temperature?: number;
+  maxTokens?: number;
+  topP?: number;
+  stop?: string[];
+  tools?: Tool[];
+  toolChoice?: "auto" | "required" | "none" | { name: string };
+  stream?: boolean;
+  metadata?: Record<string, unknown>; // プロバイダ固有の設定
+}
+```
+
+### CompletionResponse
+
+```typescript
+interface CompletionResponse {
+  id: string;
+  message: Message;
+  usage: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+    estimatedCost?: number;
+  };
+  model: string;
+  provider: string;
+  finishReason: "stop" | "length" | "tool_calls" | "content_filter" | "error";
+  metadata?: Record<string, unknown>;
+}
+```
+
+### Message
+
+```typescript
+interface Message {
+  role: "user" | "assistant" | "system" | "tool";
+  content: string | ContentPart[];
+  name?: string; // ツールメッセージ用
+  toolCallId?: string; // ツールレスポンス用
+  toolCalls?: ToolCall[]; // ツールコールを含むアシスタントメッセージ用
+}
+
+type ContentPart = 
+  | { type: "text"; text: string }
+  | { type: "image_url"; imageUrl: { url: string } }
+  | { type: "image"; source: { type: "base64"; mediaType: string; data: string } };
+```
+
+### Tool
+
+```typescript
+interface Tool {
+  name: string;
+  description: string;
+  parameters: JSONSchema;
+  handler: ToolHandler;
+  metadata?: {
+    cacheHint?: boolean; // プロンプトキャッシング用
+    requiresConfirmation?: boolean;
+  };
+}
+
+type ToolHandler = (
+  params: Record<string, unknown>,
+  context: ToolContext
+) => Promise<ToolResult>;
+
+interface ToolContext {
+  conversationId?: string;
+  userId?: string;
+  metadata?: Record<string, unknown>;
+}
+```
+
+### AIProvider インターフェース
+
+```typescript
+interface AIProvider {
+  readonly name: string;
+  readonly capabilities: ProviderCapabilities;
+  
+  complete(request: CompletionRequest): Promise<CompletionResponse>;
+  stream(request: CompletionRequest): AsyncIterable<StreamChunk>;
+  
+  transformRequest(request: CompletionRequest): ProviderSpecificRequest;
+  transformResponse(response: ProviderSpecificResponse): CompletionResponse;
+  transformTools(tools: Tool[]): ProviderSpecificTools;
+  
+  handleError(error: unknown): AIError;
+  shouldRetry(error: AIError): boolean;
+}
+
+interface ProviderCapabilities {
+  streaming: boolean;
+  toolCalling: boolean;
+  vision: boolean;
+  jsonMode: boolean;
+  maxTokens: number;
+  maxContextLength: number;
+}
+```
+
+## コア関数
+
+### `createCompletion(...)`
+
+#### パラメータ
+
+* `request: CompletionRequest`: コンプリーションリクエスト
+
+#### 戻り値
+
+* `Promise<CompletionResponse>`: コンプリーションレスポンス
+
+#### 説明
+
+コンプリーションリクエストを適切なプロバイダ/SDKに送信し、統一されたレスポンスを返します。
+
+### `streamCompletion(...)`
+
+#### パラメータ
+
+* `request: CompletionRequest`: `stream: true`を含むコンプリーションリクエスト
+
+#### 戻り値
+
+* `AsyncIterable<StreamChunk>`: レスポンスチャンクのストリーム
+
+#### 説明
+
+コンプリーションレスポンスをストリーミングし、チャンクが到着するたびにyieldします。
+
+### `registerAdapter(...)`
+
+#### パラメータ
+
+* `adapter: AIProvider`: 登録するプロバイダアダプター
+
+#### 説明
+
+新しいプロバイダ/SDKアダプターをAI SDKに登録します。
+
+### `registerTool(...)`
+
+#### パラメータ
+
+* `tool: Tool`: 登録するツール定義
+
+#### 説明
+
+すべてのコンプリーションで使用できるツールを登録します。
+
+### `executeTool(...)`
+
+#### パラメータ
+
+* `toolCall: ToolCall`: 実行するツールコール
+* `context: ToolContext`: 実行コンテキスト
+
+#### 戻り値
+
+* `Promise<ToolResult>`: ツール実行結果
+
+#### 説明
+
+提供されたパラメータとコンテキストで登録済みのツールを実行します。
+
+## ビルトインアダプター
+
+AI SDKは、一般的なプロバイダとSDK用のアダプターと共に提供される必要があります：
+
+**SDKアダプター:**
+* OpenRouter (`openrouter`) - マルチプロバイダルーティング
+* Groq (`groq`) - 超高速推論
+* Vercel AI (`vercel-ai`) - ユニバーサルAI SDKラッパー
+
+各アダプターは認証、リクエスト/レスポンス変換、エラーマッピング、プロバイダ固有の機能を処理します。
+
+## エラーハンドリング
+
+### エラータイプ
+
+```typescript
+enum AIErrorType {
+  AuthenticationError = "authentication_error",
+  RateLimitError = "rate_limit_error",
+  InvalidRequestError = "invalid_request_error",
+  APIError = "api_error",
+  NetworkError = "network_error",
+  TimeoutError = "timeout_error",
+  ProviderNotFoundError = "provider_not_found_error",
+  ToolExecutionError = "tool_execution_error"
+}
+
+class AIError extends Error {
+  constructor(
+    public type: AIErrorType,
+    message: string,
+    public provider?: string,
+    public retryable: boolean = false
+  ) {
+    super(message);
+  }
+}
+```
+
+### リトライ戦略
+
+SDKは、リトライ可能なエラーに対してジッターを伴う指数バックオフを実装しています：
+* 初期遅延: 1秒
+* 最大遅延: 60秒
+* 最大リトライ回数: 3回
+
+特定のエラータイプのみがリトライされます：レート制限（retry-afterヘッダーを尊重）、ネットワークエラー、タイムアウトエラー、サーバーエラー（5xx）。
+
+## nmgineとの統合
+
+AI SDKは以下を通じてnmgineと統合されます：
+* システムプロンプトへの自動メモリ注入
+* 標準ツールとして登録されたメモリツール
+* メモリ圧縮をトリガーする会話追跡
+* メモリ操作ごとのトークン使用量追跡
+
+## 設定
+
+設定は環境変数を通じて処理されます：
+
+**一般設定:**
+* `AI_SDK_DEFAULT_PROVIDER`: デフォルトのプロバイダ/SDK（例："openrouter"、"anthropic"）
+* `AI_SDK_DEFAULT_MODEL`: デフォルトのモデル
+* `AI_SDK_REQUEST_TIMEOUT`: リクエストタイムアウト（ミリ秒、デフォルト: 60000）
+* `AI_SDK_MAX_RETRIES`: 最大リトライ試行回数（デフォルト: 3）
+
+**プロバイダ固有:**
+* `OPENROUTER_API_KEY`、`GROQ_API_KEY`、`ANTHROPIC_API_KEY`、`OPENAI_API_KEY`など
+
+設定は、`provider`および`metadata`フィールドを通じてリクエストごとに上書きできます。

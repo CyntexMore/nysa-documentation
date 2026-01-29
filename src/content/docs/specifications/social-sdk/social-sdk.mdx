@@ -1,0 +1,564 @@
+---
+title: Social SDK
+description: Specifications for Nysa's Social SDK.
+---
+
+import { Steps, Card } from '@astrojs/starlight/components';
+
+The Social SDK is responsible for providing a unified interface to integrate **any social platform** to be used with Nysa. This includes messaging platforms (Discord, Telegram, Slack), social networks (Twitter/X, Bluesky), and any service with an API that enables communication. It exposes critical functions and interfaces to define how messages are sent, reactions are handled, voice calls work, etc., so that implementing a new platform doesn't require changing anything else in the codebase.
+
+Should be exposed via `@nysa-daemon/social-sdk`.
+
+## Problem Statement
+
+Without the Social SDK, Nysa's core components would require constant updates to support new platforms, and every platform integration would be a unique snowflake. The main challenges are:
+
+* **Platform fragmentation**: Different social platforms have wildly different APIs, data models, and capabilities. Discord has guilds and voice channels; Telegram has supergroups and topics; Slack has workspaces and threads.
+* **Feature inconsistency**: Not all platforms support the same features (voice calls, reactions, threads, DMs, media uploads, etc.), requiring graceful degradation.
+* **Breaking changes**: Social platforms frequently update their APIs, which would cascade changes throughout the codebase.
+* **Authentication complexity**: Each platform has its own auth mechanism (bot tokens, OAuth, session cookies, API keys).
+
+We need a unified abstraction layer that handles all platform-specific logic while exposing a consistent interface to the rest of Nysa. **Nysa should never know or care which social platform is being used.**
+
+## Architecture
+
+The Social SDK follows a provider pattern with adapters for each social platform:
+
+1. **Core Interface**: Defines standard message, channel, user, and interaction interfaces
+2. **Adapter Layer**: Platform-specific adapters that implement the core interface
+   - **Discord Adapter**: Full-featured with voice support
+   - **Custom Adapters**: User-created platform integrations
+3. **Capability System**: Declares what features each platform supports
+4. **Event System**: Unified event handling for incoming messages, reactions, etc.
+
+All adapters implement the same `SocialPlatform` interface, ensuring consistent behavior regardless of underlying implementation.
+
+## Message Flow
+
+### Outgoing Messages
+
+<Steps>
+1. Application creates a message using the unified interface
+2. Social SDK validates the request and selects appropriate adapter
+3. Adapter checks if the requested capability is supported
+4. Adapter transforms request to platform-specific format
+5. Request is sent with retry logic and error handling
+6. Response is transformed back to unified format
+7. Results are returned to the application
+</Steps>
+
+### Incoming Events
+
+<Steps>
+1. Platform adapter receives webhook/polling event
+2. Event is normalized to unified format
+3. Event is emitted through the central event bus
+4. Application receives standardized event regardless of source platform
+</Steps>
+
+## Design Decisions
+
+### Why Adapters for Each Platform?
+
+Using adapters for each platform allows:
+* Clean separation between platform-specific logic and application code
+* Easy addition of new platforms without modifying core code
+* Platform-specific optimizations where beneficial
+* Graceful degradation when features are unavailable
+
+The alternative (direct API calls only) would tightly couple Nysa to specific platforms and make multi-platform support a nightmare.
+
+### Why Capability System?
+
+Different platforms have different capabilities. A capability system allows:
+* Runtime feature detection ("Can this platform do voice calls?")
+* Graceful degradation (hide UI elements, skip unsupported operations)
+* Clear documentation of what each adapter supports
+* Type-safe feature checking
+
+The tradeoff is slightly more boilerplate, but this is negligible compared to the complexity of handling platform differences everywhere.
+
+### Why Unified Event Format?
+
+Different platforms have different event structures. A unified format allows:
+* Write event handlers once, use everywhere
+* Easy platform switching without rewriting logic
+* Consistent event processing regardless of source
+* Easier testing and mocking
+
+## Technical
+
+## Data Model
+
+### PlatformMessage
+
+```typescript
+interface PlatformMessage {
+  id: string;
+  platform: string; // "discord", "telegram", etc.
+  channelId: string;
+  guildId?: string; // Server/workspace ID if applicable
+  threadId?: string; // Thread/topic ID if applicable
+  author: PlatformUser;
+  content: string;
+  attachments: Attachment[];
+  embeds: Embed[];
+  reactions: Reaction[];
+  timestamp: Date;
+  editedTimestamp?: Date;
+  replyTo?: string; // Message ID this is replying to
+  mentions: PlatformUser[];
+  metadata?: Record<string, unknown>; // Platform-specific data
+}
+
+interface Attachment {
+  id: string;
+  filename: string;
+  contentType: string;
+  size: number;
+  url: string;
+  proxyUrl?: string;
+  width?: number;
+  height?: number;
+}
+
+interface Embed {
+  title?: string;
+  description?: string;
+  url?: string;
+  timestamp?: Date;
+  color?: number;
+  footer?: { text: string; iconUrl?: string };
+  image?: { url: string; width?: number; height?: number };
+  thumbnail?: { url: string; width?: number; height?: number };
+  author?: { name: string; url?: string; iconUrl?: string };
+  fields?: { name: string; value: string; inline?: boolean }[];
+}
+
+interface Reaction {
+  emoji: string; // Unicode emoji or custom emoji ID
+  name?: string; // Custom emoji name
+  count: number;
+  me: boolean; // Whether the bot reacted with this
+}
+```
+
+### PlatformUser
+
+```typescript
+interface PlatformUser {
+  id: string;
+  platform: string;
+  username: string;
+  displayName?: string;
+  avatarUrl?: string;
+  isBot: boolean;
+  isAdmin?: boolean; // Has elevated permissions
+  metadata?: Record<string, unknown>; // Platform-specific data
+}
+```
+
+### PlatformChannel
+
+```typescript
+interface PlatformChannel {
+  id: string;
+  platform: string;
+  type: ChannelType;
+  name: string;
+  guildId?: string;
+  topic?: string;
+  nsfw?: boolean;
+  parentId?: string; // Category/thread parent
+  position?: number;
+  rateLimitPerUser?: number; // Slowmode in seconds
+  metadata?: Record<string, unknown>;
+}
+
+enum ChannelType {
+  DM = "dm",
+  GroupDM = "group_dm",
+  Text = "text",
+  Voice = "voice",
+  Category = "category",
+  Announcement = "announcement",
+  Thread = "thread",
+  Forum = "forum",
+  Stage = "stage"
+}
+```
+
+### SendMessageRequest
+
+```typescript
+interface SendMessageRequest {
+  channelId: string;
+  content?: string;
+  replyTo?: string; // Message ID to reply to
+  attachments?: AttachmentInput[];
+  embeds?: Embed[];
+  components?: MessageComponent[]; // Buttons, select menus, etc.
+  threadName?: string; // For creating threads
+  metadata?: Record<string, unknown>; // Platform-specific settings
+}
+
+interface AttachmentInput {
+  name: string;
+  data: Buffer | ReadableStream;
+  contentType?: string;
+}
+
+type MessageComponent = 
+  | ActionRow
+  | Button
+  | StringSelect
+  | UserSelect
+  | RoleSelect;
+
+interface ActionRow {
+  type: "action_row";
+  components: (Button | StringSelect | UserSelect | RoleSelect)[];
+}
+
+interface Button {
+  type: "button";
+  style: "primary" | "secondary" | "success" | "danger" | "link";
+  label?: string;
+  emoji?: string;
+  customId?: string;
+  url?: string;
+  disabled?: boolean;
+}
+```
+
+### SocialPlatform Interface
+
+```typescript
+interface SocialPlatform {
+  readonly name: string;
+  readonly capabilities: PlatformCapabilities;
+  
+  // Connection
+  connect(): Promise<void>;
+  disconnect(): Promise<void>;
+  isConnected(): boolean;
+  
+  // Messaging
+  sendMessage(request: SendMessageRequest): Promise<PlatformMessage>;
+  editMessage(messageId: string, content: string): Promise<PlatformMessage>;
+  deleteMessage(messageId: string, channelId: string): Promise<void>;
+  getMessage(messageId: string, channelId: string): Promise<PlatformMessage>;
+  
+  // Reactions
+  addReaction(messageId: string, channelId: string, emoji: string): Promise<void>;
+  removeReaction(messageId: string, channelId: string, emoji: string): Promise<void>;
+  
+  // Channels
+  getChannel(channelId: string): Promise<PlatformChannel>;
+  getChannels(guildId?: string): Promise<PlatformChannel[]>;
+  createChannel(name: string, type: ChannelType, guildId?: string): Promise<PlatformChannel>;
+  
+  // Users
+  getUser(userId: string): Promise<PlatformUser>;
+  getCurrentUser(): Promise<PlatformUser>;
+  
+  // DMs
+  createDM(userId: string): Promise<PlatformChannel>;
+  sendDM(userId: string, request: Omit<SendMessageRequest, "channelId">): Promise<PlatformMessage>;
+  
+  // Voice (if supported)
+  joinVoiceChannel?(channelId: string): Promise<VoiceConnection>;
+  leaveVoiceChannel?(channelId: string): Promise<void>;
+  
+  // Event handling
+  onMessage(handler: (message: PlatformMessage) => void): void;
+  onReactionAdd(handler: (reaction: ReactionEvent) => void): void;
+  onReactionRemove(handler: (reaction: ReactionEvent) => void): void;
+  onTypingStart(handler: (event: TypingEvent) => void): void;
+  
+  // Error handling
+  handleError(error: unknown): PlatformError;
+  shouldRetry(error: PlatformError): boolean;
+}
+
+interface PlatformCapabilities {
+  // Messaging
+  sendMessages: boolean;
+  editMessages: boolean;
+  deleteMessages: boolean;
+  replyToMessages: boolean;
+  sendEmbeds: boolean;
+  sendAttachments: boolean;
+  sendComponents: boolean; // Buttons, selects
+  
+  // Reactions
+  addReactions: boolean;
+  removeReactions: boolean;
+  customEmojis: boolean;
+  
+  // Channels
+  createChannels: boolean;
+  deleteChannels: boolean;
+  threads: boolean;
+  forums: boolean;
+  
+  // DMs
+  directMessages: boolean;
+  groupDMs: boolean;
+  
+  // Voice
+  voiceCalls: boolean;
+  voiceRecording: boolean;
+  voiceStreaming: boolean;
+  
+  // Advanced
+  presence: boolean; // Online/away/dnd status
+  richPresence: boolean; // Activity details
+  webhooks: boolean;
+  slashCommands: boolean;
+}
+
+interface VoiceConnection {
+  channelId: string;
+  guildId?: string;
+  
+  // Audio I/O
+  playAudio(source: AudioSource): Promise<void>;
+  stopAudio(): void;
+  pauseAudio(): void;
+  resumeAudio(): void;
+  
+  // Recording
+  startRecording?(options?: RecordingOptions): Promise<void>;
+  stopRecording?(): Promise<AudioData>;
+  
+  // Events
+  onUserJoin(handler: (user: PlatformUser) => void): void;
+  onUserLeave(handler: (user: PlatformUser) => void): void;
+  onAudioData(handler: (data: AudioData) => void): void;
+  
+  disconnect(): Promise<void>;
+}
+
+type AudioSource = 
+  | { type: "file"; path: string }
+  | { type: "url"; url: string }
+  | { type: "stream"; stream: ReadableStream }
+  | { type: "buffer"; buffer: Buffer };
+
+interface AudioData {
+  data: Buffer;
+  format: "opus" | "pcm" | "wav";
+  sampleRate?: number;
+  channels?: number;
+}
+
+interface RecordingOptions {
+  maxDuration?: number; // Max recording duration in ms
+  silenceTimeout?: number; // Stop after silence duration in ms
+}
+
+interface ReactionEvent {
+  messageId: string;
+  channelId: string;
+  guildId?: string;
+  user: PlatformUser;
+  emoji: string;
+  emojiName?: string;
+}
+
+interface TypingEvent {
+  channelId: string;
+  guildId?: string;
+  user: PlatformUser;
+  timestamp: Date;
+}
+```
+
+## Core Functions
+
+### `sendMessage(...)`
+
+#### Parameters
+
+* `request: SendMessageRequest`: The message to send
+
+#### Returns
+
+* `Promise<PlatformMessage>`: The sent message with platform-assigned ID
+
+#### Description
+
+Sends a message to the specified channel. The adapter handles platform-specific formatting and limitations (e.g., Discord's 2000 character limit, Telegram's Markdown parsing).
+
+### `sendDM(...)`
+
+#### Parameters
+
+* `userId: string`: The user to message
+* `request: SendMessageRequest`: The message content
+
+#### Returns
+
+* `Promise<PlatformMessage>`: The sent message
+
+#### Description
+
+Sends a direct message to a user. Automatically creates the DM channel if it doesn't exist (if supported by the platform).
+
+### `addReaction(...)`
+
+#### Parameters
+
+* `messageId: string`: The message to react to
+* `channelId: string`: The channel containing the message
+* `emoji: string`: The emoji to react with (Unicode or custom ID)
+
+#### Returns
+
+* `Promise<void>`
+
+#### Description
+
+Adds a reaction to a message. Throws `CapabilityNotSupportedError` if the platform doesn't support reactions.
+
+### `joinVoiceChannel(...)`
+
+#### Parameters
+
+* `channelId: string`: The voice channel to join
+
+#### Returns
+
+* `Promise<VoiceConnection>`: The voice connection object
+
+#### Description
+
+Joins a voice channel and returns a connection object for audio I/O. Throws `CapabilityNotSupportedError` if the platform doesn't support voice.
+
+### `registerAdapter(...)`
+
+#### Parameters
+
+* `adapter: SocialPlatform`: The platform adapter to register
+
+#### Description
+
+Registers a new platform adapter with the Social SDK.
+
+### `getAdapter(...)`
+
+#### Parameters
+
+* `platform: string`: The platform name
+
+#### Returns
+
+* `SocialPlatform`: The registered adapter
+
+#### Description
+
+Retrieves a registered adapter by name.
+
+## Built-in Adapters
+
+The Social SDK should ship with adapters for common platforms:
+
+| Platform | Name | Capabilities |
+|:---------|:-----|:-------------|
+| Discord | `discord` | Full messaging, reactions, threads, voice calls, DMs |
+| Telegram | `telegram` | Full messaging, reactions (limited), threads (topics), DMs, no voice |
+| Slack | `slack` | Messaging, threads, reactions, limited DMs, no voice |
+
+Each adapter handles authentication, rate limiting, request/response transformation, error mapping, and platform-specific features.
+
+## Capability Checking
+
+Before using platform-specific features, always check capabilities:
+
+```typescript
+const adapter = getAdapter("telegram");
+
+if (adapter.capabilities.voiceCalls) {
+  // This will never run for Telegram
+  await adapter.joinVoiceChannel(channelId);
+} else {
+  // Handle gracefully
+  await adapter.sendMessage({
+    channelId,
+    content: "Voice calls aren't supported on this platform!"
+  });
+}
+```
+
+## Error Handling
+
+### Error Types
+
+```typescript
+enum PlatformErrorType {
+  AuthenticationError = "authentication_error",
+  RateLimitError = "rate_limit_error",
+  InvalidRequestError = "invalid_request_error",
+  APIError = "api_error",
+  NetworkError = "network_error",
+  TimeoutError = "timeout_error",
+  PlatformNotFoundError = "platform_not_found_error",
+  CapabilityNotSupportedError = "capability_not_supported_error",
+  MessageNotFoundError = "message_not_found_error",
+  ChannelNotFoundError = "channel_not_found_error",
+  UserNotFoundError = "user_not_found_error",
+  PermissionError = "permission_error"
+}
+
+class PlatformError extends Error {
+  constructor(
+    public type: PlatformErrorType,
+    message: string,
+    public platform?: string,
+    public retryable: boolean = false,
+    public retryAfter?: number // Seconds until retry is safe
+  ) {
+    super(message);
+  }
+}
+```
+
+### Retry Strategy
+
+The SDK implements exponential backoff with jitter for retryable errors:
+* Initial delay: 1 second
+* Maximum delay: 60 seconds
+* Maximum retries: 3
+
+Only certain error types are retried: rate limits (with respect to retry-after headers), network errors, timeout errors, and server errors (5xx).
+
+## Integration with AI SDK
+
+The Social SDK integrates with the AI SDK through:
+* Message content being passed to [`createCompletion`](/specifications/ai-sdk#createcompletion)
+* Tool calls triggering Social SDK functions (send messages, add reactions)
+* Streaming responses being chunked and sent as typing indicators
+
+## Integration with nmgine
+
+The Social SDK integrates with nmgine through:
+* User IDs being associated with memories
+* Conversation context being tracked per channel/thread
+* Platform-specific user preferences being stored
+
+## Configuration
+
+Configuration is handled via environment variables:
+
+**General:**
+* `SOCIAL_SDK_DEFAULT_PLATFORM`: Default platform (e.g., "discord")
+* `SOCIAL_SDK_REQUEST_TIMEOUT`: Request timeout in ms (default: 30000)
+* `SOCIAL_SDK_MAX_RETRIES`: Maximum retry attempts (default: 3)
+
+**Discord:**
+* `DISCORD_BOT_TOKEN`: Discord bot token
+* `DISCORD_CLIENT_ID`: Discord application client ID
+* `DISCORD_INTENTS`: Gateway intents (default: all non-privileged)
+
+Configuration can be overridden per request via the `metadata` field in requests.

@@ -1,0 +1,696 @@
+---
+title: Discord ボイスコール
+description: Nysa の Discord ボイスコール仕様
+---
+
+import { Steps, Card } from '@astrojs/starlight/components';
+
+Discord ボイスコールシステムにより、Nysa は音声チャンネルに参加し、ユーザーの音声をテキストに変換し、合成音声で応答することができます。これはオーディオパイプラインの要件により、最も複雑な統合の一つです。
+
+音声システムは、ローカル（whisper.cpp 経由の Whisper）または API ベース（Groq、OpenAI、ElevenLabs、Fish Audio）のいずれかの **STT（音声認識）および TTS（音声合成）プロバイダー** で動作するように設計されています。オーディオパイプラインは、初期の PCM 変換後はプロバイダーに依存しません。
+
+## アーキテクチャ
+
+ボイスコールシステムは双方向のオーディオパイプラインに従います：
+
+<Steps>
+1. **接続**: Discord.js 音声モジュールを使用して音声チャンネルに参加
+2. **受信**: `VoiceReceiver` を介してユーザーからの Opus オーディオパケットをキャプチャ
+3. **デコード**: opusscript を使用して Opus パケットを生 PCM に変換
+4. **バッファリング**: 無音検出と共にオーディオチャンクを蓄積
+5. **変換**: ffmpeg を使用して PCM（48kHz ステレオ）を WAV（16kHz モノラル）にトランスコーディング
+6. **文字起こし**: 設定された STT プロバイダー（Whisper、Groq、OpenAI など）に WAV を送信
+7. **処理**: AI SDK に文字起こしを送信して応答を生成
+8. **合成**: 設定された TTS プロバイダーを使用して AI 応答を音声に変換
+9. **再生**: 音声を音声チャンネルにストリーミングして再生
+</Steps>
+
+## オーディオパイプライン
+
+### 着信オーディオフロー
+
+```
+Discord 音声チャンネル
+        ↓
+VoiceReceiver (Opus パケット, 48kHz ステレオ)
+        ↓
+opusscript.decode() → PCM (48kHz, 16-bit, ステレオ)
+        ↓
+バッファ蓄積 (3秒ウィンドウ + 無音検出)
+        ↓
+ffmpeg: PCM から WAV へ (16kHz, モノラル)
+        ↓
+STT プロバイダー (Whisper、Groq、OpenAI など)
+        ↓
+AI SDK (応答生成)
+        ↓
+TTS プロバイダー (Groq、Fish Audio、ElevenLabs など)
+        ↓
+VoiceConnection.play() → Discord
+```
+
+### Opus から PCM へのデコード
+
+Discord は音声を Opus エンコードされたパケットとして送信します。これらは処理のために生 PCM にデコードする必要があります：
+
+```typescript
+import opusscript from "opusscript";
+
+// Opus デコーダーを初期化
+// 48000 Hz, 2 チャンネル (ステレオ), AUDIO アプリケーション
+const opus = new opusscript(48000, 2, opusscript.Application.AUDIO);
+
+// 各 Opus パケットをデコード
+const pcmChunk = opus.decode(opusPacket);
+```
+
+**主なパラメーター：**
+- **サンプルレート**: 48,000 Hz (Discord のネイティブレート)
+- **チャンネル**: 2 (ステレオ)
+- **ビット深度**: 16-bit 符号付き整数 (PCM16)
+- **フレームサイズ**: 960 サンプル (48kHz で 20ms)
+
+### オーディオバッファリング戦略
+
+音声は、文字起こし前に完全な発話がキャプチャされるようにバッファリングされます：
+
+```typescript
+interface AudioBufferConfig {
+  /** 処理前にオーディオを蓄積する時間 (ms) */
+  bufferDurationMs: 3000;
+  
+  /** ストリームを終了する無音の時間 (ms) */
+  silenceEndDurationMs: 2000;
+  
+  /** 文字起こしに必要な最小オーディオ時間 (ms) */
+  minimumDurationMs: 500;
+}
+```
+
+バッファリングシステムは 2 つのトリガーを使用します：
+1. **時間ベース**: `bufferDurationMs` (3 秒) のオーディオ後に処理
+2. **無音ベース**: `EndBehaviorType.AfterSilence` が発火したときに処理 (2 秒の無音)
+
+## 音声受信機のセットアップ
+
+### サブスクリプション
+
+```typescript
+import { VoiceReceiver, EndBehaviorType } from "@discordjs/voice";
+
+interface VoiceReceiverConfig {
+  receiver: VoiceReceiver;
+  userId: string;                    // Discord ユーザー ID
+  displayName: string;               // ユーザーの表示名
+  onTranscription?: OnTranscriptionCallback;
+  onComplete?: () => void;
+}
+
+type OnTranscriptionCallback = (
+  userId: string,
+  displayName: string,
+  transcription: string
+) => void | Promise<void>;
+```
+
+受信機は特定のユーザーのオーディオストリームをサブスクライブします：
+
+```typescript
+const audioStream = receiver.subscribe(userId, {
+  end: {
+    behavior: EndBehaviorType.AfterSilence,
+    duration: 2000, // 2 秒の無音後に終了
+  },
+});
+```
+
+### ストリームイベントの処理
+
+```typescript
+audioStream.on("data", (chunk: Buffer) => {
+  // Opus から PCM にデコード
+  const pcm = opus.decode(chunk);
+  pcmChunks.push(pcm);
+  pcmBytesReceived += pcm.length;
+  
+  // 処理タイマーをリセット
+  scheduleProcessing();
+});
+
+audioStream.on("end", () => {
+  // 無音しきい値に達した - 蓄積されたオーディオを処理
+  processBufferedAudio();
+});
+
+audioStream.on("close", () => {
+  // ストリームが閉じられた - 残りのオーディオを処理
+  processBufferedAudio();
+});
+```
+
+## オーディオ変換
+
+### PCM から WAV へのトランスコーディング
+
+Whisper は 16kHz モノラル WAV 入力を必要とします。Discord は 48kHz ステレオ PCM を提供します。変換は ffmpeg を介して行われます：
+
+```typescript
+async function convertPcmToWav(
+  inputPath: string,   // 生 PCM ファイルへのパス
+  outputPath: string   // 出力 WAV ファイルへのパス
+): Promise<string> {
+  const ffmpeg = spawn("ffmpeg", [
+    "-y",                    // 出力を上書き
+    "-loglevel", "error",    // 静かな出力
+    "-f", "s16le",           // 入力形式: 符号付き 16-bit リトルエンディアン
+    "-ar", "48000",          // 入力サンプルレート: 48kHz
+    "-ac", "2",              // 入力チャンネル: ステレオ
+    "-i", inputPath,         // 入力ファイル
+    "-ar", "16000",          // 出力サンプルレート: 16kHz
+    "-ac", "1",              // 出力チャンネル: モノラル
+    "-f", "wav",             // 出力形式: WAV
+    outputPath,
+  ]);
+  
+  // ... 完了処理
+}
+```
+
+**変換パラメーター：**
+
+| パラメーター | 入力 | 出力 |
+|:----------|:------|:-------|
+| 形式 | 生 PCM (s16le) | WAV |
+| サンプルレート | 48,000 Hz | 16,000 Hz |
+| チャンネル | 2 (ステレオ) | 1 (モノラル) |
+| ビット深度 | 16-bit | 16-bit |
+
+### 最小時間のパディング
+
+非常に短いオーディオクリップ（500ms 未満）は、Whisper の問題を引き起こす可能性があります。システムは無音でパディングします：
+
+```typescript
+async function ensureMinimumDuration(wavPath: string): Promise<string> {
+  const duration = await getAudioDuration(wavPath);
+  
+  if (duration < 500) {
+    // 500ms に達するまで無音でパディング
+    const ffmpeg = spawn("ffmpeg", [
+      "-i", wavPath,
+      "-af", "apad=pad_dur=0.5",  // 0.5 秒までパディング
+      "-y",
+      "-loglevel", "error",
+      paddedPath,
+    ]);
+    return paddedPath;
+  }
+  
+  return wavPath;
+}
+```
+
+## 音声認識 (STT)
+
+Nysa は統一されたインターフェースを通じて複数の STT プロバイダーをサポートします。デフォルトの実装は Whisper（whisper.cpp 経由）を使用しますが、どのプロバイダーも統合できます。
+
+### STT プロバイダーインターフェース
+
+```typescript
+interface STTProvider {
+  readonly name: string;
+  
+  /**
+   * オーディオファイルをテキストに文字起こし
+   * @param audioPath WAV ファイルへのパス (16kHz, モノラル)
+   * @returns 文字起こしされたテキスト、または音声が検出されない場合は空文字列
+   */
+  transcribe(audioPath: string): Promise<string>;
+  
+  /**
+   * プロバイダーが適切に設定され利用可能かどうかを確認
+   */
+  isAvailable(): Promise<boolean>;
+}
+```
+
+### Whisper (ローカル) プロバイダー
+
+デフォルトの STT プロバイダーは、whisper.cpp を介して Whisper を使用してローカルで文字起こしを行います。
+
+#### 設定
+
+```typescript
+// 環境変数
+const WHISPER_MODEL_PATH = process.env.WHISPER_MODEL_PATH || "whisper-small.en-q5_1";
+const WHISPER_COMMAND = process.env.WHISPER_COMMAND || "whisper";
+```
+
+`WHISPER_COMMAND` は、単純なコマンドと複雑なシェルコマンドの両方をサポートします：
+
+```bash
+# 単純なコマンド
+WHISPER_COMMAND=whisper
+
+# nix-shell と共に
+WHISPER_COMMAND='nix-shell -p whisper-cpp --run "whisper-cli --model /path/to/model.bin --threads 4"'
+
+# 特定のモデルパスを指定
+WHISPER_COMMAND='whisper-cli --model /path/to/ggml-small.en-q5_1.bin'
+```
+
+### 文字起こしプロセス
+
+```typescript
+async function transcribeAudio(audioPath: string): Promise<string> {
+  const proc = spawn(command, args);
+  
+  let output = "";
+  let error = "";
+  
+  proc.stdout?.on("data", (data) => {
+    output += data.toString();
+  });
+  
+  proc.stderr?.on("data", (data) => {
+    error += data.toString();
+  });
+  
+  // 出力から文字起こしを解析
+  const lines = output.split('\n');
+  const textLines = lines
+    .filter(line => !isTimestampLine(line))
+    .map(line => line.trim())
+    .filter(line => line.length > 0);
+  
+  return textLines.join(' ').trim();
+}
+```
+
+### 出力のクリーニング
+
+Whisper の出力には、削除が必要なメタデータが含まれることがよくあります：
+
+```typescript
+const cleanedTranscript = transcript
+  .replace(/\[BLANK_AUDIO\]/gi, "")           // 無音マーカーを削除
+  .replace(/\[\d+:\d+:\d+\.\d+ --> \d+:\d+:\d+\.\d+\]/g, "")  // タイムスタンプを削除
+  .replace(/^\s*$/m, "")                       // 空行を削除
+  .trim();
+```
+
+## 音声合成 (TTS)
+
+Nysa は統一されたインターフェースを通じて複数の TTS プロバイダーをサポートします。オーディオパイプラインはプロバイダーに依存せず、オーディオファイル（WAV、MP3、OGG）を生成できる TTS サービスであれば統合できます。
+
+### TTS プロバイダーインターフェース
+
+```typescript
+interface TTSProvider {
+  readonly name: string;
+  readonly supportsStreaming: boolean;
+  
+  /**
+   * テキストを音声に合成
+   * @param text 合成するテキスト
+   * @returns 生成されたオーディオファイルへのパス
+   */
+  synthesize(text: string): Promise<string>;
+  
+  /**
+   * プロバイダーが適切に設定され利用可能かどうかを確認
+   */
+  isAvailable(): Promise<boolean>;
+}
+```
+
+### Groq TTS (Orpheus) プロバイダー
+
+Groq は Orpheus モデルを介して高速で高品質な TTS を提供します。
+
+```typescript
+async function synthesize(text: string): Promise<string> {
+  const response = await fetch("https://api.groq.com/openai/v1/audio/speech", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "canopylabs/orpheus-v1-english",
+      input: text,
+      voice: "troy",           // デフォルト音声
+      response_format: "wav",  // 互換性のため WAV
+    }),
+  });
+  
+  const arrayBuffer = await response.arrayBuffer();
+  const audioPath = `/tmp/nysa_tts_${Date.now()}.wav`;
+  await fs.writeFile(audioPath, Buffer.from(arrayBuffer));
+  
+  return audioPath;
+}
+```
+
+**利用可能な Orpheus 音声：** `troy`, `dan`, `emma`, `karen`, `leo`, `mia`, `zoe`
+
+### 代替 TTS プロバイダー
+
+#### Fish Audio
+
+カスタムボイスクローニングには、Fish Audio S1 を使用できます：
+
+```typescript
+const response = await fetch("https://api.fish.audio/v1/tts", {
+  method: "POST",
+  headers: {
+    "Authorization": `Bearer ${process.env.FISH_AUDIO_API_KEY}`,
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    text: text,
+    reference_id: "custom-voice-id",
+    format: "wav",
+  }),
+});
+```
+
+#### OpenAI TTS
+
+```typescript
+const response = await fetch("https://api.openai.com/v1/audio/speech", {
+  method: "POST",
+  headers: {
+    "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    model: "tts-1",
+    input: text,
+    voice: "alloy", // alloy, echo, fable, onyx, nova, shimmer
+    response_format: "wav",
+  }),
+});
+```
+
+#### ElevenLabs
+
+```typescript
+const response = await fetch(
+  `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+  {
+    method: "POST",
+    headers: {
+      "xi-api-key": process.env.ELEVENLABS_API_KEY,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      text: text,
+      model_id: "eleven_multilingual_v2",
+      output_format: "mp3_44100_128",
+    }),
+  }
+);
+```
+
+## 音声接続の管理
+
+### チャンネルへの参加
+
+```typescript
+import {
+  joinVoiceChannel,
+  createAudioPlayer,
+  createAudioResource,
+  VoiceConnection,
+  AudioPlayer,
+} from "@discordjs/voice";
+
+interface VoiceSession {
+  connection: VoiceConnection;
+  player: AudioPlayer;
+  receiver: VoiceReceiver;
+  channelId: string;
+  guildId: string;
+  activeUsers: Map<string, UserAudioStream>;
+}
+
+async function joinVoiceChannel(
+  channelId: string,
+  guildId: string,
+  adapter: DiscordGatewayAdapter
+): Promise<VoiceSession> {
+  const connection = joinVoiceChannel({
+    channelId,
+    guildId,
+    adapterCreator: adapter,
+    selfDeaf: false,
+    selfMute: false,
+  });
+  
+  const player = createAudioPlayer();
+  connection.subscribe(player);
+  
+  const receiver = connection.receiver;
+  
+  // すべてのユーザーに対して音声検出を設定
+  receiver.speaking.on("start", (userId) => {
+    setupUserAudioStream(receiver, userId);
+  });
+  
+  return { connection, player, receiver, channelId, guildId, activeUsers: new Map() };
+}
+```
+
+### オーディオの再生
+
+```typescript
+async function playAudio(
+  session: VoiceSession,
+  audioPath: string
+): Promise<void> {
+  const resource = createAudioResource(audioPath, {
+    inputType: StreamType.Arbitrary,
+  });
+  
+  session.player.play(resource);
+  
+  return new Promise((resolve) => {
+    session.player.once(AudioPlayerStatus.Idle, () => {
+      resolve();
+    });
+  });
+}
+```
+
+### チャンネルからの退出
+
+```typescript
+async function leaveVoiceChannel(session: VoiceSession): Promise<void> {
+  // すべてのアクティブなオーディオストリームを停止
+  session.activeUsers.forEach((stream) => {
+    stream.cleanup();
+  });
+  
+  // プレーヤーを停止
+  session.player.stop();
+  
+  // 接続を破棄
+  session.connection.destroy();
+}
+```
+
+## サウンドボード
+
+Nysa はボイスコール中にサウンドボードエフェクトを再生することをサポートします：
+
+```typescript
+interface SoundboardEffect {
+  id: string;
+  name: string;
+  filePath: string;
+  emoji?: string;
+  volume: number; // 0.0 から 1.0
+}
+
+class SoundboardManager {
+  private effects: Map<string, SoundboardEffect> = new Map();
+  
+  registerEffect(effect: SoundboardEffect): void {
+    this.effects.set(effect.id, effect);
+  }
+  
+  async playEffect(
+    session: VoiceSession,
+    effectId: string
+  ): Promise<void> {
+    const effect = this.effects.get(effectId);
+    if (!effect) throw new Error(`Effect ${effectId} not found`);
+    
+    const resource = createAudioResource(effect.filePath, {
+      inlineVolume: true,
+    });
+    
+    resource.volume?.setVolume(effect.volume);
+    session.player.play(resource);
+  }
+}
+```
+
+## 設定
+
+### 必要な環境変数
+
+```bash
+# Discord
+DISCORD_BOT_TOKEN=your_bot_token
+
+# STT プロバイダー (いずれかを選択)
+WHISPER_COMMAND=whisper-cli
+WHISPER_MODEL_PATH=/path/to/ggml-model.bin
+# または API ベースの STT の場合:
+# GROQ_API_KEY=your_groq_api_key
+# OPENAI_API_KEY=your_openai_api_key
+
+# TTS プロバイダー (いずれかを選択)
+GROQ_API_KEY=your_groq_api_key
+# または:
+# FISH_AUDIO_API_KEY=your_fish_audio_key
+# OPENAI_API_KEY=your_openai_api_key
+# ELEVENLABS_API_KEY=your_elevenlabs_key
+```
+
+### プロバイダーの選択
+
+```bash
+# アクティブな STT プロバイダーを設定
+VOICE_STT_PROVIDER=whisper  # オプション: whisper, groq, openai
+
+# アクティブな TTS プロバイダーを設定
+VOICE_TTS_PROVIDER=groq     # オプション: groq, fish-audio, openai, elevenlabs
+```
+
+### オプションの環境変数
+
+```bash
+# Whisper 設定 (ローカル STT の場合)
+WHISPER_THREADS=4              # 文字起こし用 CPU スレッド数
+WHISPER_LANGUAGE=en            # 言語コード
+WHISPER_BEAM_SIZE=5            # ビームサーチの幅
+
+# オーディオ処理
+VOICE_BUFFER_DURATION_MS=3000  # バッファウィンドウ
+VOICE_SILENCE_DURATION_MS=2000 # 無音しきい値
+VOICE_MIN_DURATION_MS=500      # 最小クリップ時間
+
+# TTS 音声 (Groq)
+VOICE_TTS_VOICE=troy           # Orpheus 音声
+VOICE_TTS_MODEL=canopylabs/orpheus-v1-english
+
+# 代替 TTS (Fish Audio)
+FISH_AUDIO_API_KEY=your_key
+FISH_AUDIO_VOICE_ID=custom-voice-id
+```
+
+## エラーハンドリング
+
+### 一般的な問題
+
+| 問題 | 原因 | 解決策 |
+|:------|:------|:---------|
+| "ffmpeg not found" | ffmpeg が PATH にない | ffmpeg をインストールし、PATH に含まれていることを確認 |
+| "Opus decoding failed" | 破損した Opus パケット | パケットをスキップし、処理を継続 |
+| "Whisper command not found" | WHISPER_COMMAND が誤設定 | コマンドパスを確認し、インストールを検証 |
+| "Groq API error" | 無効な API キーまたはレート制限 | GROQ_API_KEY を確認し、レート制限をチェック |
+| "Voice connection timeout" | ネットワークの問題 | 接続を再試行し、Discord のステータスを確認 |
+| "No transcription" | オーディオが小さすぎる/短すぎる | マイクを確認し、無音しきい値を調整 |
+
+### グレースフルデグラデーション
+
+音声システムは正常に失敗するように設計されています：
+
+```typescript
+// Whisper が設定されていない場合でも、ボイスは機能しますが文字起こしなし
+if (!commandWorks) {
+  console.warn("Voice transcription disabled");
+  return ""; // 空の文字起こし、AI はコンテキストに応じて応答可能
+}
+
+// TTS が失敗した場合、テキストチャンネルにテキスト応答にフォールバック
+try {
+  const audioPath = await textToSpeech(response);
+  await playAudio(session, audioPath);
+} catch (error) {
+  console.error("TTS failed, falling back to text:", error);
+  await sendMessage({
+    channelId: textChannelId,
+    content: `**Nysa:** ${response}`,
+  });
+}
+```
+
+## パフォーマンスに関する考慮事項
+
+### CPU 使用率
+
+- **Opus デコード**: アクティブな話者あたり約 5-10% CPU
+- **ffmpeg トランスコーディング**: 変換あたり約 10-20% CPU
+- **Whisper**: モデルサイズに依存
+  - `tiny`: ~50MB RAM, 高速
+  - `small`: ~200MB RAM, 良好な品質
+  - `medium`: ~1GB RAM, より良い品質
+  - `large`: ~2GB RAM, 最高品質
+
+### レイテンシ内訳
+
+| ステージ | 典型的なレイテンシ |
+|:------|:----------------|
+| オーディオバッファリング | 3000ms (設定可能) |
+| Opus から PCM へのデコード | 10ms 未満 |
+| PCM → WAV 変換 | 100-300ms |
+| Whisper 文字起こし | 200-1000ms (モデル依存) |
+| AI 応答生成 | 500-3000ms (モデル依存) |
+| TTS 合成 | 500-2000ms |
+| **合計ラウンドトリップ** | **約 5-10 秒** |
+
+### 最適化のヒント
+
+1. **より小さい Whisper モデルを使用** してレイテンシを低減 (`medium` の代わりに `small` または `base`)
+2. **バッファ時間を短縮** してより応答性の高いインタラクションを実現 (トレードオフ: より多くの部分的な文字起こし)
+3. **利用可能な場合は GPU で Whisper を実行** (大幅な速度向上)
+4. **ローカルモデルの代わりに Groq を TTS に使用** (より高速だが、より高価)
+5. **無音の処理をスキップ** するために音声アクティビティ検出を有効化
+
+## AI SDK との統合
+
+音声パイプラインは、会話応答のために AI SDK と統合されます：
+
+```typescript
+async function handleVoiceTranscription(
+  userId: string,
+  displayName: string,
+  transcription: string
+): Promise<void> {
+  // nmgine から会話コンテキストを取得
+  const memories = await retrieveMemory({ keyword: userId });
+  
+  // AI 応答を生成
+  const response = await createCompletion({
+    messages: [
+      { role: "system", content: buildSystemPrompt(memories) },
+      { role: "user", content: `${displayName}: ${transcription}` },
+    ],
+    model: process.env.AI_SDK_DEFAULT_MODEL,
+  });
+  
+  // 応答を合成して再生
+  const audioPath = await textToSpeech(response.message.content);
+  await playAudio(session, audioPath);
+  
+  // メモリに保存
+  await saveMemory({
+    userId: [userId],
+    content: `User said: ${transcription}. I responded: ${response.message.content}`,
+    type: MemoryType.Episodic,
+  });
+}
+```

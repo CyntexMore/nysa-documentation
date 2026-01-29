@@ -1,0 +1,564 @@
+---
+title: Social SDK
+description: NysaのSocial SDK仕様。
+---
+
+import { Steps, Card } from '@astrojs/starlight/components';
+
+Social SDKは、**あらゆるソーシャルプラットフォーム**をNysaと連携させるための統一インターフェースを提供します。これにはメッセージングプラットフォーム（Discord、Telegram、Slack）、ソーシャルネットワーク（Twitter/X、Bluesky）、および通信を可能にするAPIを持つあらゆるサービスが含まれます。メッセージの送信方法、リアクションの処理方法、音声通話の動作などを定義する重要な関数とインターフェースを公開し、新しいプラットフォームの実装に際してコードベースの他の部分を変更する必要がないようにします。
+
+`@nysa-daemon/social-sdk`を通じて公開される必要があります。
+
+## 問題提起
+
+Social SDKがなければ、Nysaのコアコンポーネントは新しいプラットフォームをサポートするために常に更新が必要となり、各プラットフォームの統合は独自の実装となってしまいます。主な課題は以下の通りです：
+
+* **プラットフォームの断片化**: 異なるソーシャルプラットフォームは、API、データモデル、機能が大きく異なります。Discordにはギルドとボイスチャンネルがあります。Telegramにはスーパーグループとトピックがあります。Slackにはワークスペースとスレッドがあります。
+* **機能の不一致**: すべてのプラットフォームが同じ機能（音声通話、リアクション、スレッド、DM、メディアアップロードなど）をサポートしているわけではなく、優雅な機能低下が必要です。
+* **破壊的変更**: ソーシャルプラットフォームは頻繁にAPIを更新し、これがコードベース全体に変更をもたらします。
+* **認証の複雑さ**: 各プラットフォームには独自の認証メカニズム（ボットトークン、OAuth、セッションクッキー、APIキー）があります。
+
+すべてのプラットフォーム固有のロジックを処理しながら、Nysaの他の部分に一貫したインターフェースを公開する統合抽象化レイヤーが必要です。**Nysaはどのソーシャルプラットフォームが使用されているかを知る必要も、気にする必要もありません。**
+
+## アーキテクチャ
+
+Social SDKは、各ソーシャルプラットフォーム用のアダプターを持つプロバイダパターンに従います：
+
+1. **コアインターフェース**: 標準的なメッセージ、チャンネル、ユーザー、インタラクションインターフェースを定義
+2. **アダプターレイヤー**: コアインターフェースを実装するプラットフォーム固有のアダプター
+   - **Discordアダプター**: 音声サポートを含むフル機能
+   - **カスタムアダプター**: ユーザー作成のプラットフォーム統合
+3. **機能システム**: 各プラットフォームがサポートする機能を宣言
+4. **イベントシステム**: 受信メッセージ、リアクションなどの統一イベント処理
+
+すべてのアダプターは同じ`SocialPlatform`インターフェースを実装し、基盤となる実装に関わらず一貫した動作を保証します。
+
+## メッセージフロー
+
+### 送信メッセージ
+
+<Steps>
+1. アプリケーションが統一インターフェースを使用してメッセージを作成
+2. Social SDKがリクエストを検証し、適切なアダプターを選択
+3. アダプターがリクエストされた機能がサポートされているか確認
+4. アダプターがリクエストをプラットフォーム固有の形式に変換
+5. リトライロジックとエラー処理を伴ってリクエストを送信
+6. レスポンスを統一形式に変換して返却
+7. 結果をアプリケーションに返却
+</Steps>
+
+### 受信イベント
+
+<Steps>
+1. プラットフォームアダプターがWebhook/ポーリングイベントを受信
+2. イベントを統一形式に正規化
+3. イベントが中央イベントバスを通じて発行される
+4. アプリケーションがソースプラットフォームに関係なく標準化されたイベントを受信
+</Steps>
+
+## 設計判断
+
+### なぜ各プラットフォームにアダプターを使用するのか？
+
+各プラットフォームにアダプターを使用することで、以下が可能になります：
+* プラットフォーム固有のロジックとアプリケーションコードの明確な分離
+* コアコードを変更せずに新しいプラットフォームを簡単に追加
+* 有益な場合のプラットフォーム固有の最適化
+* 機能が利用できない場合の優雅な機能低下
+
+代替案（直接API呼び出しのみ）では、Nysaは特定のプラットフォームに密結合され、マルチプラットフォームサポートが困難になります。
+
+### なぜ機能システムを使用するのか？
+
+異なるプラットフォームには異なる機能があります。機能システムにより、以下が可能になります：
+* 実行時の機能検出（「このプラットフォームで音声通話はできますか？」）
+* 優雅な機能低下（UI要素を非表示にし、サポートされていない操作をスキップ）
+* 各アダプターがサポートする機能の明確なドキュメント化
+* 型安全な機能チェック
+
+トレードオフは少しだけボイラープレートが増えることですが、これはあらゆる場所でプラットフォームの違いを処理する複雑さと比較して無視できる程度です。
+
+### なぜ統一イベントフォーマットを使用するのか？
+
+異なるプラットフォームには異なるイベント構造があります。統一形式により、以下が可能になります：
+* イベントハンドラーを一度書けばどこでも使用可能
+* ロジックを書き直すことなく簡単にプラットフォームを切り替え可能
+* ソースに関係なく一貫したイベント処理
+* より簡単なテストとモッキング
+
+## 技術仕様
+
+## データモデル
+
+### PlatformMessage
+
+```typescript
+interface PlatformMessage {
+  id: string;
+  platform: string; // "discord", "telegram", など
+  channelId: string;
+  guildId?: string; // 該当する場合のサーバー/ワークスペースID
+  threadId?: string; // 該当する場合のスレッド/トピックID
+  author: PlatformUser;
+  content: string;
+  attachments: Attachment[];
+  embeds: Embed[];
+  reactions: Reaction[];
+  timestamp: Date;
+  editedTimestamp?: Date;
+  replyTo?: string; // 返信先のメッセージID
+  mentions: PlatformUser[];
+  metadata?: Record<string, unknown>; // プラットフォーム固有のデータ
+}
+
+interface Attachment {
+  id: string;
+  filename: string;
+  contentType: string;
+  size: number;
+  url: string;
+  proxyUrl?: string;
+  width?: number;
+  height?: number;
+}
+
+interface Embed {
+  title?: string;
+  description?: string;
+  url?: string;
+  timestamp?: Date;
+  color?: number;
+  footer?: { text: string; iconUrl?: string };
+  image?: { url: string; width?: number; height?: number };
+  thumbnail?: { url: string; width?: number; height?: number };
+  author?: { name: string; url?: string; iconUrl?: string };
+  fields?: { name: string; value: string; inline?: boolean }[];
+}
+
+interface Reaction {
+  emoji: string; // Unicode絵文字またはカスタム絵文字ID
+  name?: string; // カスタム絵文字名
+  count: number;
+  me: boolean; // ボットがこれでリアクションしたかどうか
+}
+```
+
+### PlatformUser
+
+```typescript
+interface PlatformUser {
+  id: string;
+  platform: string;
+  username: string;
+  displayName?: string;
+  avatarUrl?: string;
+  isBot: boolean;
+  isAdmin?: boolean; // 昇格権限を持つかどうか
+  metadata?: Record<string, unknown>; // プラットフォーム固有のデータ
+}
+```
+
+### PlatformChannel
+
+```typescript
+interface PlatformChannel {
+  id: string;
+  platform: string;
+  type: ChannelType;
+  name: string;
+  guildId?: string;
+  topic?: string;
+  nsfw?: boolean;
+  parentId?: string; // カテゴリー/スレッド親
+  position?: number;
+  rateLimitPerUser?: number; // スローモード（秒単位）
+  metadata?: Record<string, unknown>;
+}
+
+enum ChannelType {
+  DM = "dm",
+  GroupDM = "group_dm",
+  Text = "text",
+  Voice = "voice",
+  Category = "category",
+  Announcement = "announcement",
+  Thread = "thread",
+  Forum = "forum",
+  Stage = "stage"
+}
+```
+
+### SendMessageRequest
+
+```typescript
+interface SendMessageRequest {
+  channelId: string;
+  content?: string;
+  replyTo?: string; // 返信先のメッセージID
+  attachments?: AttachmentInput[];
+  embeds?: Embed[];
+  components?: MessageComponent[]; // ボタン、セレクトメニューなど
+  threadName?: string; // スレッド作成用
+  metadata?: Record<string, unknown>; // プラットフォーム固有の設定
+}
+
+interface AttachmentInput {
+  name: string;
+  data: Buffer | ReadableStream;
+  contentType?: string;
+}
+
+type MessageComponent = 
+  | ActionRow
+  | Button
+  | StringSelect
+  | UserSelect
+  | RoleSelect;
+
+interface ActionRow {
+  type: "action_row";
+  components: (Button | StringSelect | UserSelect | RoleSelect)[];
+}
+
+interface Button {
+  type: "button";
+  style: "primary" | "secondary" | "success" | "danger" | "link";
+  label?: string;
+  emoji?: string;
+  customId?: string;
+  url?: string;
+  disabled?: boolean;
+}
+```
+
+### SocialPlatformインターフェース
+
+```typescript
+interface SocialPlatform {
+  readonly name: string;
+  readonly capabilities: PlatformCapabilities;
+  
+  // 接続
+  connect(): Promise<void>;
+  disconnect(): Promise<void>;
+  isConnected(): boolean;
+  
+  // メッセージング
+  sendMessage(request: SendMessageRequest): Promise<PlatformMessage>;
+  editMessage(messageId: string, content: string): Promise<PlatformMessage>;
+  deleteMessage(messageId: string, channelId: string): Promise<void>;
+  getMessage(messageId: string, channelId: string): Promise<PlatformMessage>;
+  
+  // リアクション
+  addReaction(messageId: string, channelId: string, emoji: string): Promise<void>;
+  removeReaction(messageId: string, channelId: string, emoji: string): Promise<void>;
+  
+  // チャンネル
+  getChannel(channelId: string): Promise<PlatformChannel>;
+  getChannels(guildId?: string): Promise<PlatformChannel[]>;
+  createChannel(name: string, type: ChannelType, guildId?: string): Promise<PlatformChannel>;
+  
+  // ユーザー
+  getUser(userId: string): Promise<PlatformUser>;
+  getCurrentUser(): Promise<PlatformUser>;
+  
+  // DM
+  createDM(userId: string): Promise<PlatformChannel>;
+  sendDM(userId: string, request: Omit<SendMessageRequest, "channelId">): Promise<PlatformMessage>;
+  
+  // 音声（サポートされている場合）
+  joinVoiceChannel?(channelId: string): Promise<VoiceConnection>;
+  leaveVoiceChannel?(channelId: string): Promise<void>;
+  
+  // イベント処理
+  onMessage(handler: (message: PlatformMessage) => void): void;
+  onReactionAdd(handler: (reaction: ReactionEvent) => void): void;
+  onReactionRemove(handler: (reaction: ReactionEvent) => void): void;
+  onTypingStart(handler: (event: TypingEvent) => void): void;
+  
+  // エラー処理
+  handleError(error: unknown): PlatformError;
+  shouldRetry(error: PlatformError): boolean;
+}
+
+interface PlatformCapabilities {
+  // メッセージング
+  sendMessages: boolean;
+  editMessages: boolean;
+  deleteMessages: boolean;
+  replyToMessages: boolean;
+  sendEmbeds: boolean;
+  sendAttachments: boolean;
+  sendComponents: boolean; // ボタン、セレクト
+  
+  // リアクション
+  addReactions: boolean;
+  removeReactions: boolean;
+  customEmojis: boolean;
+  
+  // チャンネル
+  createChannels: boolean;
+  deleteChannels: boolean;
+  threads: boolean;
+  forums: boolean;
+  
+  // DM
+  directMessages: boolean;
+  groupDMs: boolean;
+  
+  // 音声
+  voiceCalls: boolean;
+  voiceRecording: boolean;
+  voiceStreaming: boolean;
+  
+  // 高度な機能
+  presence: boolean; // オンライン/離席/取り込み中ステータス
+  richPresence: boolean; // アクティビティ詳細
+  webhooks: boolean;
+  slashCommands: boolean;
+}
+
+interface VoiceConnection {
+  channelId: string;
+  guildId?: string;
+  
+  // 音声入出力
+  playAudio(source: AudioSource): Promise<void>;
+  stopAudio(): void;
+  pauseAudio(): void;
+  resumeAudio(): void;
+  
+  // 録音
+  startRecording?(options?: RecordingOptions): Promise<void>;
+  stopRecording?(): Promise<AudioData>;
+  
+  // イベント
+  onUserJoin(handler: (user: PlatformUser) => void): void;
+  onUserLeave(handler: (user: PlatformUser) => void): void;
+  onAudioData(handler: (data: AudioData) => void): void;
+  
+  disconnect(): Promise<void>;
+}
+
+type AudioSource = 
+  | { type: "file"; path: string }
+  | { type: "url"; url: string }
+  | { type: "stream"; stream: ReadableStream }
+  | { type: "buffer"; buffer: Buffer };
+
+interface AudioData {
+  data: Buffer;
+  format: "opus" | "pcm" | "wav";
+  sampleRate?: number;
+  channels?: number;
+}
+
+interface RecordingOptions {
+  maxDuration?: number; // 最大録音時間（ミリ秒）
+  silenceTimeout?: number; // 無音後の停止時間（ミリ秒）
+}
+
+interface ReactionEvent {
+  messageId: string;
+  channelId: string;
+  guildId?: string;
+  user: PlatformUser;
+  emoji: string;
+  emojiName?: string;
+}
+
+interface TypingEvent {
+  channelId: string;
+  guildId?: string;
+  user: PlatformUser;
+  timestamp: Date;
+}
+```
+
+## コア関数
+
+### `sendMessage(...)`
+
+#### パラメータ
+
+* `request: SendMessageRequest`: 送信するメッセージ
+
+#### 戻り値
+
+* `Promise<PlatformMessage>`: プラットフォーム割り当てIDを持つ送信済みメッセージ
+
+#### 説明
+
+指定されたチャンネルにメッセージを送信します。アダプターはプラットフォーム固有のフォーマットと制限（例：Discordの2000文字制限、TelegramのMarkdownパース）を処理します。
+
+### `sendDM(...)`
+
+#### パラメータ
+
+* `userId: string`: メッセージを送るユーザー
+* `request: SendMessageRequest`: メッセージ内容
+
+#### 戻り値
+
+* `Promise<PlatformMessage>`: 送信されたメッセージ
+
+#### 説明
+
+ユーザーにダイレクトメッセージを送信します。プラットフォームでサポートされている場合、DMチャンネルが存在しない場合は自動的に作成します。
+
+### `addReaction(...)`
+
+#### パラメータ
+
+* `messageId: string`: リアクションを付けるメッセージ
+* `channelId: string`: メッセージを含むチャンネル
+* `emoji: string`: リアクションに使用する絵文字（UnicodeまたはカスタムID）
+
+#### 戻り値
+
+* `Promise<void>`
+
+#### 説明
+
+メッセージにリアクションを追加します。プラットフォームがリアクションをサポートしていない場合は`CapabilityNotSupportedError`をスローします。
+
+### `joinVoiceChannel(...)`
+
+#### パラメータ
+
+* `channelId: string`: 参加するボイスチャンネル
+
+#### 戻り値
+
+* `Promise<VoiceConnection>`: 音声接続オブジェクト
+
+#### 説明
+
+ボイスチャンネルに参加し、音声入出力用の接続オブジェクトを返します。プラットフォームが音声をサポートしていない場合は`CapabilityNotSupportedError`をスローします。
+
+### `registerAdapter(...)`
+
+#### パラメータ
+
+* `adapter: SocialPlatform`: 登録するプラットフォームアダプター
+
+#### 説明
+
+新しいプラットフォームアダプターをSocial SDKに登録します。
+
+### `getAdapter(...)`
+
+#### パラメータ
+
+* `platform: string`: プラットフォーム名
+
+#### 戻り値
+
+* `SocialPlatform`: 登録されたアダプター
+
+#### 説明
+
+名前で登録されたアダプターを取得します。
+
+## ビルトインアダプター
+
+Social SDKは一般的なプラットフォーム用のアダプターと共に提供される必要があります：
+
+| プラットフォーム | 名前 | 機能 |
+|:---------|:-----|:-------------|
+| Discord | `discord` | フルメッセージング、リアクション、スレッド、音声通話、DM |
+| Telegram | `telegram` | フルメッセージング、リアクション（制限あり）、スレッド（トピック）、DM、音声なし |
+| Slack | `slack` | メッセージング、スレッド、リアクション、制限付きDM、音声なし |
+
+各アダプターは認証、レート制限、リクエスト/レスポンス変換、エラーマッピング、およびプラットフォーム固有の機能を処理します。
+
+## 機能チェック
+
+プラットフォーム固有の機能を使用する前に、常に機能を確認してください：
+
+```typescript
+const adapter = getAdapter("telegram");
+
+if (adapter.capabilities.voiceCalls) {
+  // Telegramではこれは実行されません
+  await adapter.joinVoiceChannel(channelId);
+} else {
+  // 優雅に処理
+  await adapter.sendMessage({
+    channelId,
+    content: "このプラットフォームでは音声通話はサポートされていません！"
+  });
+}
+```
+
+## エラー処理
+
+### エラータイプ
+
+```typescript
+enum PlatformErrorType {
+  AuthenticationError = "authentication_error",
+  RateLimitError = "rate_limit_error",
+  InvalidRequestError = "invalid_request_error",
+  APIError = "api_error",
+  NetworkError = "network_error",
+  TimeoutError = "timeout_error",
+  PlatformNotFoundError = "platform_not_found_error",
+  CapabilityNotSupportedError = "capability_not_supported_error",
+  MessageNotFoundError = "message_not_found_error",
+  ChannelNotFoundError = "channel_not_found_error",
+  UserNotFoundError = "user_not_found_error",
+  PermissionError = "permission_error"
+}
+
+class PlatformError extends Error {
+  constructor(
+    public type: PlatformErrorType,
+    message: string,
+    public platform?: string,
+    public retryable: boolean = false,
+    public retryAfter?: number // リトライが安全になるまでの秒数
+  ) {
+    super(message);
+  }
+}
+```
+
+### リトライ戦略
+
+SDKは、リトライ可能なエラーに対してジッター付き指数バックオフを実装しています：
+* 初期遅延：1秒
+* 最大遅延：60秒
+* 最大リトライ回数：3回
+
+特定のエラータイプのみがリトライされます：レート制限（retry-afterヘッダーを尊重）、ネットワークエラー、タイムアウトエラー、およびサーバーエラー（5xx）。
+
+## AI SDKとの統合
+
+Social SDKは以下を通じてAI SDKと統合されます：
+* メッセージ内容が[`createCompletion`](/specifications/ai-sdk#createcompletion)に渡される
+* ツール呼び出しがSocial SDK関数をトリガー（メッセージ送信、リアクション追加）
+* ストリーミングレスポンスがチャンク化され、タイピングインジケーターとして送信される
+
+## nmgineとの統合
+
+Social SDKは以下を通じてnmgineと統合されます：
+* ユーザーIDがメモリに関連付けられる
+* 会話コンテキストがチャンネル/スレッドごとに追跡される
+* プラットフォーム固有のユーザープリファレンスが保存される
+
+## 設定
+
+設定は環境変数を通じて処理されます：
+
+**一般：**
+* `SOCIAL_SDK_DEFAULT_PLATFORM`: デフォルトプラットフォーム（例："discord"）
+* `SOCIAL_SDK_REQUEST_TIMEOUT`: リクエストタイムアウト（ミリ秒）（デフォルト：30000）
+* `SOCIAL_SDK_MAX_RETRIES`: 最大リトライ回数（デフォルト：3）
+
+**Discord：**
+* `DISCORD_BOT_TOKEN`: Discordボットトークン
+* `DISCORD_CLIENT_ID`: DiscordアプリケーションクライアントID
+* `DISCORD_INTENTS`: ゲートウェイインテント（デフォルト：すべての非特権インテント）
+
+設定は、リクエストの`metadata`フィールドを通じてリクエストごとに上書きできます。

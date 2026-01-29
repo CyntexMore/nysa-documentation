@@ -1,0 +1,696 @@
+---
+title: Discord Voice Calls
+description: Specifications for Nysa's Discord Voice Calls.
+---
+
+import { Steps, Card } from '@astrojs/starlight/components';
+
+The Discord Voice Call system enables Nysa to participate in voice channels, transcribe user speech to text, and respond with synthesized speech. This is one of the most complex integrations due to the audio pipeline requirements.
+
+The voice system is designed to work with **any STT (Speech-to-Text) and TTS (Text-to-Speech) provider**, whether local (Whisper via whisper.cpp) or API-based (Groq, OpenAI, ElevenLabs, Fish Audio). The audio pipeline is provider-agnostic after the initial PCM conversion.
+
+## Architecture
+
+The voice call system follows a bidirectional audio pipeline:
+
+<Steps>
+1. **Connection**: Join a voice channel using Discord.js voice module
+2. **Receive**: Capture Opus audio packets from users via `VoiceReceiver`
+3. **Decode**: Convert Opus packets to raw PCM using opusscript
+4. **Buffer**: Accumulate audio chunks with silence detection
+5. **Convert**: Transcode PCM (48kHz stereo) to WAV (16kHz mono) using ffmpeg
+6. **Transcribe**: Send WAV to configured STT provider (Whisper, Groq, OpenAI, etc.)
+7. **Process**: Send transcription to AI SDK for response generation
+8. **Synthesize**: Convert AI response to speech using configured TTS provider
+9. **Play**: Stream audio back to the voice channel
+</Steps>
+
+## Audio Pipeline
+
+### Incoming Audio Flow
+
+```
+Discord Voice Channel
+        ↓
+VoiceReceiver (Opus packets, 48kHz stereo)
+        ↓
+opusscript.decode() → PCM (48kHz, 16-bit, stereo)
+        ↓
+Buffer accumulation (3s window + silence detection)
+        ↓
+ffmpeg: PCM to WAV (16kHz, mono)
+        ↓
+STT Provider (Whisper, Groq, OpenAI, etc.)
+        ↓
+AI SDK (response generation)
+        ↓
+TTS Provider (Groq, Fish Audio, ElevenLabs, etc.)
+        ↓
+VoiceConnection.play() → Discord
+```
+
+### Opus to PCM Decoding
+
+Discord transmits voice audio as Opus-encoded packets. These must be decoded to raw PCM for processing:
+
+```typescript
+import opusscript from "opusscript";
+
+// Initialize Opus decoder
+// 48000 Hz, 2 channels (stereo), AUDIO application
+const opus = new opusscript(48000, 2, opusscript.Application.AUDIO);
+
+// Decode each Opus packet
+const pcmChunk = opus.decode(opusPacket);
+```
+
+**Key Parameters:**
+- **Sample Rate**: 48,000 Hz (Discord's native rate)
+- **Channels**: 2 (stereo)
+- **Bit Depth**: 16-bit signed integer (PCM16)
+- **Frame Size**: 960 samples (20ms at 48kHz)
+
+### Audio Buffering Strategy
+
+Voice audio is buffered to ensure complete utterances are captured before transcription:
+
+```typescript
+interface AudioBufferConfig {
+  /** Duration to accumulate audio before processing (ms) */
+  bufferDurationMs: 3000;
+  
+  /** Duration of silence that ends the stream (ms) */
+  silenceEndDurationMs: 2000;
+  
+  /** Minimum audio duration for transcription (ms) */
+  minimumDurationMs: 500;
+}
+```
+
+The buffering system uses two triggers:
+1. **Time-based**: Process after `bufferDurationMs` (3 seconds) of audio
+2. **Silence-based**: Process when `EndBehaviorType.AfterSilence` fires (2 seconds of silence)
+
+## Voice Receiver Setup
+
+### Subscription
+
+```typescript
+import { VoiceReceiver, EndBehaviorType } from "@discordjs/voice";
+
+interface VoiceReceiverConfig {
+  receiver: VoiceReceiver;
+  userId: string;                    // Discord user ID
+  displayName: string;               // User's display name
+  onTranscription?: OnTranscriptionCallback;
+  onComplete?: () => void;
+}
+
+type OnTranscriptionCallback = (
+  userId: string,
+  displayName: string,
+  transcription: string
+) => void | Promise<void>;
+```
+
+The receiver subscribes to a specific user's audio stream:
+
+```typescript
+const audioStream = receiver.subscribe(userId, {
+  end: {
+    behavior: EndBehaviorType.AfterSilence,
+    duration: 2000, // End after 2 seconds of silence
+  },
+});
+```
+
+### Stream Event Handling
+
+```typescript
+audioStream.on("data", (chunk: Buffer) => {
+  // Decode Opus to PCM
+  const pcm = opus.decode(chunk);
+  pcmChunks.push(pcm);
+  pcmBytesReceived += pcm.length;
+  
+  // Reset processing timer
+  scheduleProcessing();
+});
+
+audioStream.on("end", () => {
+  // Silence threshold reached - process accumulated audio
+  processBufferedAudio();
+});
+
+audioStream.on("close", () => {
+  // Stream closed - process any remaining audio
+  processBufferedAudio();
+});
+```
+
+## Audio Conversion
+
+### PCM to WAV Transcoding
+
+Whisper requires 16kHz mono WAV input. Discord provides 48kHz stereo PCM. Conversion is done via ffmpeg:
+
+```typescript
+async function convertPcmToWav(
+  inputPath: string,   // Path to raw PCM file
+  outputPath: string   // Path for output WAV file
+): Promise<string> {
+  const ffmpeg = spawn("ffmpeg", [
+    "-y",                    // Overwrite output
+    "-loglevel", "error",    // Quiet output
+    "-f", "s16le",           // Input format: signed 16-bit little-endian
+    "-ar", "48000",          // Input sample rate: 48kHz
+    "-ac", "2",              // Input channels: stereo
+    "-i", inputPath,         // Input file
+    "-ar", "16000",          // Output sample rate: 16kHz
+    "-ac", "1",              // Output channels: mono
+    "-f", "wav",             // Output format: WAV
+    outputPath,
+  ]);
+  
+  // ... handle completion
+}
+```
+
+**Conversion Parameters:**
+
+| Parameter | Input | Output |
+|:----------|:------|:-------|
+| Format | Raw PCM (s16le) | WAV |
+| Sample Rate | 48,000 Hz | 16,000 Hz |
+| Channels | 2 (stereo) | 1 (mono) |
+| Bit Depth | 16-bit | 16-bit |
+
+### Minimum Duration Padding
+
+Very short audio clips (less than 500ms) may cause Whisper issues. The system pads them with silence:
+
+```typescript
+async function ensureMinimumDuration(wavPath: string): Promise<string> {
+  const duration = await getAudioDuration(wavPath);
+  
+  if (duration < 500) {
+    // Pad with silence to reach 500ms
+    const ffmpeg = spawn("ffmpeg", [
+      "-i", wavPath,
+      "-af", "apad=pad_dur=0.5",  // Pad to 0.5 seconds
+      "-y",
+      "-loglevel", "error",
+      paddedPath,
+    ]);
+    return paddedPath;
+  }
+  
+  return wavPath;
+}
+```
+
+## Speech-to-Text (STT)
+
+Nysa supports multiple STT providers through a unified interface. The default implementation uses Whisper (via whisper.cpp), but any provider can be integrated.
+
+### STT Provider Interface
+
+```typescript
+interface STTProvider {
+  readonly name: string;
+  
+  /**
+   * Transcribe audio file to text
+   * @param audioPath Path to WAV file (16kHz, mono)
+   * @returns Transcribed text, or empty string if no speech detected
+   */
+  transcribe(audioPath: string): Promise<string>;
+  
+  /**
+   * Check if the provider is properly configured and available
+   */
+  isAvailable(): Promise<boolean>;
+}
+```
+
+### Whisper (Local) Provider
+
+The default STT provider uses Whisper via whisper.cpp for local transcription.
+
+#### Configuration
+
+```typescript
+// Environment variables
+const WHISPER_MODEL_PATH = process.env.WHISPER_MODEL_PATH || "whisper-small.en-q5_1";
+const WHISPER_COMMAND = process.env.WHISPER_COMMAND || "whisper";
+```
+
+The `WHISPER_COMMAND` supports both simple commands and complex shell commands:
+
+```bash
+# Simple command
+WHISPER_COMMAND=whisper
+
+# With nix-shell
+WHISPER_COMMAND='nix-shell -p whisper-cpp --run "whisper-cli --model /path/to/model.bin --threads 4"'
+
+# With specific model path
+WHISPER_COMMAND='whisper-cli --model /path/to/ggml-small.en-q5_1.bin'
+```
+
+### Transcription Process
+
+```typescript
+async function transcribeAudio(audioPath: string): Promise<string> {
+  const proc = spawn(command, args);
+  
+  let output = "";
+  let error = "";
+  
+  proc.stdout?.on("data", (data) => {
+    output += data.toString();
+  });
+  
+  proc.stderr?.on("data", (data) => {
+    error += data.toString();
+  });
+  
+  // Parse transcription from output
+  const lines = output.split('\n');
+  const textLines = lines
+    .filter(line => !isTimestampLine(line))
+    .map(line => line.trim())
+    .filter(line => line.length > 0);
+  
+  return textLines.join(' ').trim();
+}
+```
+
+### Output Cleaning
+
+Whisper output often contains metadata that must be stripped:
+
+```typescript
+const cleanedTranscript = transcript
+  .replace(/\[BLANK_AUDIO\]/gi, "")           // Remove blank audio markers
+  .replace(/\[\d+:\d+:\d+\.\d+ --> \d+:\d+:\d+\.\d+\]/g, "")  // Remove timestamps
+  .replace(/^\s*$/, "")                       // Remove empty lines
+  .trim();
+```
+
+## Text-to-Speech (TTS)
+
+Nysa supports multiple TTS providers through a unified interface. The audio pipeline is provider-agnostic - any TTS service that can generate audio files (WAV, MP3, OGG) can be integrated.
+
+### TTS Provider Interface
+
+```typescript
+interface TTSProvider {
+  readonly name: string;
+  readonly supportsStreaming: boolean;
+  
+  /**
+   * Synthesize text to speech
+   * @param text Text to synthesize
+   * @returns Path to generated audio file
+   */
+  synthesize(text: string): Promise<string>;
+  
+  /**
+   * Check if the provider is properly configured and available
+   */
+  isAvailable(): Promise<boolean>;
+}
+```
+
+### Groq TTS (Orpheus) Provider
+
+Groq provides fast, high-quality TTS via the Orpheus model.
+
+```typescript
+async function synthesize(text: string): Promise<string> {
+  const response = await fetch("https://api.groq.com/openai/v1/audio/speech", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "canopylabs/orpheus-v1-english",
+      input: text,
+      voice: "troy",           // Default voice
+      response_format: "wav",  // WAV for compatibility
+    }),
+  });
+  
+  const arrayBuffer = await response.arrayBuffer();
+  const audioPath = `/tmp/nysa_tts_${Date.now()}.wav`;
+  await fs.writeFile(audioPath, Buffer.from(arrayBuffer));
+  
+  return audioPath;
+}
+```
+
+**Available Orpheus Voices:** `troy`, `dan`, `emma`, `karen`, `leo`, `mia`, `zoe`
+
+### Alternative TTS Providers
+
+#### Fish Audio
+
+For custom voice cloning, Fish Audio S1 can be used:
+
+```typescript
+const response = await fetch("https://api.fish.audio/v1/tts", {
+  method: "POST",
+  headers: {
+    "Authorization": `Bearer ${process.env.FISH_AUDIO_API_KEY}`,
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    text: text,
+    reference_id: "custom-voice-id",
+    format: "wav",
+  }),
+});
+```
+
+#### OpenAI TTS
+
+```typescript
+const response = await fetch("https://api.openai.com/v1/audio/speech", {
+  method: "POST",
+  headers: {
+    "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    model: "tts-1",
+    input: text,
+    voice: "alloy", // alloy, echo, fable, onyx, nova, shimmer
+    response_format: "wav",
+  }),
+});
+```
+
+#### ElevenLabs
+
+```typescript
+const response = await fetch(
+  `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+  {
+    method: "POST",
+    headers: {
+      "xi-api-key": process.env.ELEVENLABS_API_KEY,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      text: text,
+      model_id: "eleven_multilingual_v2",
+      output_format: "mp3_44100_128",
+    }),
+  }
+);
+```
+
+## Voice Connection Management
+
+### Joining a Channel
+
+```typescript
+import {
+  joinVoiceChannel,
+  createAudioPlayer,
+  createAudioResource,
+  VoiceConnection,
+  AudioPlayer,
+} from "@discordjs/voice";
+
+interface VoiceSession {
+  connection: VoiceConnection;
+  player: AudioPlayer;
+  receiver: VoiceReceiver;
+  channelId: string;
+  guildId: string;
+  activeUsers: Map<string, UserAudioStream>;
+}
+
+async function joinVoiceChannel(
+  channelId: string,
+  guildId: string,
+  adapter: DiscordGatewayAdapter
+): Promise<VoiceSession> {
+  const connection = joinVoiceChannel({
+    channelId,
+    guildId,
+    adapterCreator: adapter,
+    selfDeaf: false,
+    selfMute: false,
+  });
+  
+  const player = createAudioPlayer();
+  connection.subscribe(player);
+  
+  const receiver = connection.receiver;
+  
+  // Set up speech detection for all users
+  receiver.speaking.on("start", (userId) => {
+    setupUserAudioStream(receiver, userId);
+  });
+  
+  return { connection, player, receiver, channelId, guildId, activeUsers: new Map() };
+}
+```
+
+### Playing Audio
+
+```typescript
+async function playAudio(
+  session: VoiceSession,
+  audioPath: string
+): Promise<void> {
+  const resource = createAudioResource(audioPath, {
+    inputType: StreamType.Arbitrary,
+  });
+  
+  session.player.play(resource);
+  
+  return new Promise((resolve) => {
+    session.player.once(AudioPlayerStatus.Idle, () => {
+      resolve();
+    });
+  });
+}
+```
+
+### Leaving a Channel
+
+```typescript
+async function leaveVoiceChannel(session: VoiceSession): Promise<void> {
+  // Stop all active audio streams
+  session.activeUsers.forEach((stream) => {
+    stream.cleanup();
+  });
+  
+  // Stop player
+  session.player.stop();
+  
+  // Destroy connection
+  session.connection.destroy();
+}
+```
+
+## Soundboard
+
+Nysa supports playing soundboard effects during voice calls:
+
+```typescript
+interface SoundboardEffect {
+  id: string;
+  name: string;
+  filePath: string;
+  emoji?: string;
+  volume: number; // 0.0 to 1.0
+}
+
+class SoundboardManager {
+  private effects: Map<string, SoundboardEffect> = new Map();
+  
+  registerEffect(effect: SoundboardEffect): void {
+    this.effects.set(effect.id, effect);
+  }
+  
+  async playEffect(
+    session: VoiceSession,
+    effectId: string
+  ): Promise<void> {
+    const effect = this.effects.get(effectId);
+    if (!effect) throw new Error(`Effect ${effectId} not found`);
+    
+    const resource = createAudioResource(effect.filePath, {
+      inlineVolume: true,
+    });
+    
+    resource.volume?.setVolume(effect.volume);
+    session.player.play(resource);
+  }
+}
+```
+
+## Configuration
+
+### Required Environment Variables
+
+```bash
+# Discord
+DISCORD_BOT_TOKEN=your_bot_token
+
+# STT Provider (choose one)
+WHISPER_COMMAND=whisper-cli
+WHISPER_MODEL_PATH=/path/to/ggml-model.bin
+# OR for API-based STT:
+# GROQ_API_KEY=your_groq_api_key
+# OPENAI_API_KEY=your_openai_api_key
+
+# TTS Provider (choose one)
+GROQ_API_KEY=your_groq_api_key
+# OR:
+# FISH_AUDIO_API_KEY=your_fish_audio_key
+# OPENAI_API_KEY=your_openai_api_key
+# ELEVENLABS_API_KEY=your_elevenlabs_key
+```
+
+### Provider Selection
+
+```bash
+# Set active STT provider
+VOICE_STT_PROVIDER=whisper  # Options: whisper, groq, openai
+
+# Set active TTS provider  
+VOICE_TTS_PROVIDER=groq     # Options: groq, fish-audio, openai, elevenlabs
+```
+
+### Optional Environment Variables
+
+```bash
+# Whisper configuration (for local STT)
+WHISPER_THREADS=4              # CPU threads for transcription
+WHISPER_LANGUAGE=en            # Language code
+WHISPER_BEAM_SIZE=5            # Beam search width
+
+# Audio processing
+VOICE_BUFFER_DURATION_MS=3000  # Buffer window
+VOICE_SILENCE_DURATION_MS=2000 # Silence threshold
+VOICE_MIN_DURATION_MS=500      # Minimum clip duration
+
+# TTS voice (Groq)
+VOICE_TTS_VOICE=troy           # Orpheus voice
+VOICE_TTS_MODEL=canopylabs/orpheus-v1-english
+
+# Alternative TTS (Fish Audio)
+FISH_AUDIO_API_KEY=your_key
+FISH_AUDIO_VOICE_ID=custom-voice-id
+```
+
+## Error Handling
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|:------|:------|:---------|
+| "ffmpeg not found" | ffmpeg not in PATH | Install ffmpeg and ensure it's in PATH |
+| "Opus decoding failed" | Corrupted Opus packet | Skip packet, continue processing |
+| "Whisper command not found" | WHISPER_COMMAND misconfigured | Check command path, verify installation |
+| "Groq API error" | Invalid API key or rate limit | Verify GROQ_API_KEY, check rate limits |
+| "Voice connection timeout" | Network issues | Retry connection, check Discord status |
+| "No transcription" | Audio too quiet/short | Check microphone, adjust silence threshold |
+
+### Graceful Degradation
+
+The voice system is designed to fail gracefully:
+
+```typescript
+// If Whisper is not configured, voice still works but without transcription
+if (!commandWorks) {
+  console.warn("Voice transcription disabled");
+  return ""; // Empty transcription, AI can still respond contextually
+}
+
+// If TTS fails, fall back to text response in text channel
+try {
+  const audioPath = await textToSpeech(response);
+  await playAudio(session, audioPath);
+} catch (error) {
+  console.error("TTS failed, falling back to text:", error);
+  await sendMessage({
+    channelId: textChannelId,
+    content: `**Nysa:** ${response}`,
+  });
+}
+```
+
+## Performance Considerations
+
+### CPU Usage
+
+- **Opus decoding**: ~5-10% CPU per active speaker
+- **ffmpeg transcoding**: ~10-20% CPU per conversion
+- **Whisper**: Depends on model size
+  - `tiny`: ~50MB RAM, fast
+  - `small`: ~200MB RAM, good quality
+  - `medium`: ~1GB RAM, better quality
+  - `large`: ~2GB RAM, best quality
+
+### Latency Breakdown
+
+| Stage | Typical Latency |
+|:------|:----------------|
+| Audio buffering | 3000ms (configurable) |
+| Opus to PCM decode | less than 10ms |
+| PCM → WAV conversion | 100-300ms |
+| Whisper transcription | 200-1000ms (model dependent) |
+| AI response generation | 500-3000ms (model dependent) |
+| TTS synthesis | 500-2000ms |
+| **Total round-trip** | **~5-10 seconds** |
+
+### Optimization Tips
+
+1. **Use a smaller Whisper model** for lower latency (`small` or `base` instead of `medium`)
+2. **Reduce buffer duration** for more responsive interactions (trade-off: more partial transcriptions)
+3. **Run Whisper on GPU** if available (significant speedup)
+4. **Use Groq for TTS** instead of local models (faster, though more expensive)
+5. **Enable voice activity detection** to skip processing silence
+
+## Integration with AI SDK
+
+The voice pipeline integrates with the AI SDK for conversational responses:
+
+```typescript
+async function handleVoiceTranscription(
+  userId: string,
+  displayName: string,
+  transcription: string
+): Promise<void> {
+  // Get conversation context from nmgine
+  const memories = await retrieveMemory({ keyword: userId });
+  
+  // Generate AI response
+  const response = await createCompletion({
+    messages: [
+      { role: "system", content: buildSystemPrompt(memories) },
+      { role: "user", content: `${displayName}: ${transcription}` },
+    ],
+    model: process.env.AI_SDK_DEFAULT_MODEL,
+  });
+  
+  // Synthesize and play response
+  const audioPath = await textToSpeech(response.message.content);
+  await playAudio(session, audioPath);
+  
+  // Save to memory
+  await saveMemory({
+    userId: [userId],
+    content: `User said: ${transcription}. I responded: ${response.message.content}`,
+    type: MemoryType.Episodic,
+  });
+}
+```

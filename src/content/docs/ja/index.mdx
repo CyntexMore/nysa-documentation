@@ -1,0 +1,39 @@
+---
+title: Nysaへようこそ！
+description: 汎用AIランタイム。
+template: splash
+hero:
+  tagline: TypeScript 100%で構築された汎用AIデーモン。
+  image:
+    file: ../../../assets/nysa.svg
+  actions:
+    - text: はじめに
+      link: /ja/introduction/what-is-this
+      icon: right-arrow
+    - text: ソースコードを見る
+      link: https://github.com/CyntexMore/nysa
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## 機能
+
+<CardGrid stagger>
+	<Card title="Nysaとチャット" icon="discord">
+	    Discord、Telegram、SlackでNysaとチャットできます。テキストだけでなく、Discordでは音声通話もサポートされています。SDKを通じて拡張可能！
+	</Card>
+	<Card title="Nysaとゲームをプレイ" icon="rocket">
+	    Minecraftはすぐにプレイできますが、SDKを通じて他のゲームも実装できます。
+	</Card>
+	<Card title="BYO API" icon="pencil">
+	    Nysaのインスタンスをセルフホストし、独自のAPIとキーを持ち込みましょう。使用したいAPIが実装されていなくても、SDKで簡単に自分で実装できます。
+	</Card>
+	<Card title="Nysaをカスタマイズ" icon="setting">
+	    `.env`ファイルまたはWebインターフェースを通じて、NysaのペルソナとLLM設定を簡単にカスタマイズできます。
+	</Card>
+	<Card title="プラグインを検索" icon="open-book">
+	    マーケットプレイスでNysaのプラグインやプラットフォーム/ゲーム統合を簡単に検索できます。
+	</Card>
+</CardGrid>

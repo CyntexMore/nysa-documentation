@@ -1,0 +1,41 @@
+---
+title: これは何ですか？
+description: Nysaとは何ですか？
+---
+
+Nysa（発音：/ニーサ/）は汎用AIデーモンです。オープンソースで、TypeScript 100%で書かれています。ただし、一部の機能にはネイティブバイナリが必要です。自分のマシン、2ユーロのVPS、またはRaspberry Piで実行できます。Node/Bunが動作する環境なら、Nysaも動作します。
+
+テスト実行にはすでに高額な費用がかかるため（これは修正される必要があります...）、任意のAPIと組み合わせて使用できるように設計されています。ベンダーロックインはありません。
+
+## 機能
+
+主な機能をいくつか紹介します：
+
+* DiscordとTelegramでのテキストメッセージ、プライベートメッセージとグループ/ギルドの両方で対応；
+* Discordでの音声通話（サウンドボードも付いています；3）；
+* ゲームのプレイ（Minecraftはすぐに利用可能）；
+* ファイルシステムへのアクセス、**同意のもとで**；
+* マシンでのコマンド実行、フルアクセスまたは隔離された環境；
+* 人間の記憶と同じように機能する完全カスタムのメモリエンジン：繰り返しが記憶を強化し、重要性は文脈から判断され、時間とともに記憶は薄れていきます。
+
+可能性は無限大です。Social SDKとGame SDKのおかげです。[マーケットプレイス](/marketplace)でペルソナ、プラグイン、プラットフォーム統合を検索したり、[自分で作成](/guides/overview)したりできます。すべてはモデルが呼び出せる追加ツールです。
+
+## モデル
+
+メインチャットモデル、音声通話「チャットモデル」（テキストを処理・生成する）、テキスト読み上げモデル、音声認識モデル、メモリエンジンモデルに、別々のモデルを使用できます。
+
+任意のタスクに対して任意のAPIとモデルを使用できますが、例えばメインチャットモデルには、速度、知性、会話スキル、ツール呼び出し能力、コストのバランスが取れたモデルを使用することをお勧めします。一例は[Kimi K2 0905](https://openrouter.ai/moonshotai/kimi-k2-0905)です。より重く遅い推論モデル（[Gemini 3 Flash](https://openrouter.ai/google/gemini-3-flash-preview)など）の使用は推奨されません。なぜなら、このユースケースでは応答速度と品質が大幅に低下し、コストがはるかに高くなるからです。Geminiモデルはエージェントタスクには推奨されません。ツール呼び出しがひどいためですが、それはさておき。[OpenRouter](https://openrouter.ai/)は一般的にこの役割に推奨されます。コストがかなり良いためです。ただし、リアルタイム音声通話には、[Groq](https://groq.com/)の方が高い速度（秒間約200-300トークン）のため、より有益でしょう。Kimiの場合、[百万トークンあたり約160%のコスト](https://console.groq.com/docs/model/moonshotai/kimi-k2-instruct-0905)がかかりますが。
+
+音声通話には、推奨されるTTSモデルはGroq API経由の[Whisper Large V3 Turbo](https://console.groq.com/docs/model/whisper-large-v3-turbo)です。非常に優れた性能で、非常に高速で、非常に安価です。[tinydiarize](https://github.com/akashmjn/tinydiarize)を使用した[whisper.cpp](https://github.com/ggml-org/whisper.cpp)を通じて、[Whisper Small V3 EN Q5_1](https://huggingface.co/ggerganov/whisper.cpp/blob/main/ggml-small.en-q5_1.bin)をローカルで実行することは、複数人の会話には実際に有益かもしれません。将来、tinydiarize入力のより良いサポートが計画されています。tinydiarizeに関して言えば、Nysaはすでに話者のユーザーIDに基づいて異なるユーザー入力を分離しています。STTモデルについては、[Orpheus V1 English](https://console.groq.com/docs/model/canopylabs/orpheus-v1-english)、またはカスタムボイスが必要な場合は[Fish Audio S1](https://docs.fish.audio/developer-guide/getting-started/introduction)を使用できます。ただし、Fish Audio S1はOrpheusよりかなり高価です。
+
+## 費用
+
+導入を読んで気づいていない場合がありますが、Nysaは現在実行するのに多額の費用がかかります。コスト最適化が計画されていますが、Nysaのアーキテクチャの複雑さを考えると、難しいです。
+
+Nysaが破産させる場合は、最終手段としてnmgineを無効にすることができます。ただし、これはユーザー体験に**大きく**影響します。それを念頭に置いてください。より穏健なアプローチは、[llama.cpp](https://github.com/ggml-org/llama.cpp)を使用して小さなローカルモデルをセットアップし、[量子化KVキャッシュ](https://github.com/ggml-org/llama.cpp/issues/6863)を使用し、セッションのコンテキスト制限のサイズのコンテキスト制限を設定することです。
+
+## 脚注
+
+ドキュメントリポジトリは[GitHub](https://github.com/CyntexMore/nysa-documentation)で利用可能です。翻訳や文法ミスの修正での貢献を歓迎します。
+
+Xで[@saynedbread](https://x.com/saynedbread)をフォローしてください；3

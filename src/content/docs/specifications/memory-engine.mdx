@@ -166,4 +166,4 @@ Returns the first `N` (reranked) top-K results from the memory database.
 |`MEMORY_INTEGRITY_DEGRADATION_MODEL`|Decides how to degrade a memory.|Recommended to be the same model as `MEMORY_EVALUATION_MODEL`|
 |`MEMORY_RETRIEVAL_RANKING_MODEL`|Ranks the returned top-K results for memory retrieval.|A small reranker.|
 
-These can be set via environment variables.
+These can be set via environment variables. If a variable is not set, [`AI_SDK_DEFAULT_MODEL`](/specifications/ai-sdk#configuration) will be used.
